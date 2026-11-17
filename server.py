@@ -589,6 +589,9 @@ def main():
                     help="non accendere/spegnere automaticamente lo schermo virtuale")
     ap.add_argument("--usb", action="store_true",
                     help="collegamento via cavo USB con l'app 'Secondo Schermo' sull'iPad")
+    ap.add_argument("--wifi-app", metavar="IP_IPAD",
+                    help="collegamento via Wi-Fi con l'app 'Secondo Schermo' (indirizzo mostrato dall'app)")
+    ap.add_argument("--code", help="codice di abbinamento a 6 cifre mostrato dall'app")
     ap.add_argument("--http", action="store_true",
                     help="usa HTTP semplice (senza certificato; l'iPad può andare in standby)")
     args = ap.parse_args()
@@ -648,11 +651,18 @@ def main():
     app.router.add_get("/ws", ws_handler)
     app.router.add_static("/static", STATIC)
 
-    if args.usb:
-        from usb_link import run_usb
+    if args.usb or args.wifi_app:
+        from usb_link import run_usb, run_wifi
         cap, ctrl = app["capturer"], app["input"]
+        handler = lambda m: handle_client_message(m, cap, ctrl, app["cursor_allowed"])  # noqa: E731
         try:
-            run_usb(cap, lambda m: handle_client_message(m, cap, ctrl, app["cursor_allowed"]))
+            if args.wifi_app:
+                if not (args.code and args.code.isdigit() and len(args.code) == 6):
+                    print("[!] serve il codice a 6 cifre mostrato dall'app: --code 123456")
+                    return
+                run_wifi(cap, handler, args.wifi_app, args.code)
+            else:
+                run_usb(cap, handler)
         except KeyboardInterrupt:
             pass
         return

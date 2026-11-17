@@ -64,8 +64,8 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
         view.addInteraction(UIPointerInteraction(delegate: self))
         view.addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hover(_:))))
 
-        link.onState = { [weak self] s in self?.showStatus(s, autoHide: s == "Connesso via cavo") }
-        link.onConnected = { [weak self] in
+        link.onState = { [weak self] s in self?.showStatus(s, autoHide: s.hasPrefix("Connesso")) }
+        link.onConnected = { [weak self] _ in
             guard let self else { return }
             self.link.send(["t": "cursor", "on": self.drawCursor])
             self.sendInfo()
@@ -188,8 +188,12 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
             drawCursor.toggle()
             UserDefaults.standard.set(drawCursor, forKey: "drawCursor")
             link.send(["t": "cursor", "on": drawCursor])
-            showStatus("Puntatore disegnato: \(drawCursor ? "sì" : "no") · " +
-                       "\(Int(frameSize.width))×\(Int(frameSize.height)) · \(fps) fps", autoHide: true)
+            var text = "Puntatore disegnato: \(drawCursor ? "sì" : "no") · " +
+                       "\(Int(frameSize.width))×\(Int(frameSize.height)) · \(fps) fps"
+            if let ip = Link.wifiAddress() {
+                text += "\nWi-Fi: \(ip) · codice \(link.pairingCode)"
+            }
+            showStatus(text, autoHide: true)
         default:
             break
         }

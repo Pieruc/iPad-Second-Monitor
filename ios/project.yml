@@ -29,6 +29,7 @@ targets:
       properties:
         CFBundleDisplayName: Secondo Schermo
         UILaunchScreen: {}
+        NSLocalNetworkUsageDescription: Serve per ricevere lo schermo del PC tramite Wi-Fi.
         UIRequiresFullScreen: true
         UIStatusBarHidden: true
         UIViewControllerBasedStatusBarAppearance: true

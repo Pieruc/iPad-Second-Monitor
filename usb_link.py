@@ -11,7 +11,10 @@ Protocollo con l'app (uguale in Link.swift):
     iPad -> PC: 10 = messaggio JSON
 """
 
+import hashlib
+import hmac
 import json
+import os
 import plistlib
 import socket
 import struct
@@ -20,7 +23,7 @@ import time
 
 USBMUXD = ("127.0.0.1", 27015)
 APP_PORT = 7878
-T_HELLO, T_FRAME, T_JSON = 1, 2, 10
+T_HELLO, T_FRAME, T_AUTH, T_JSON = 1, 2, 3, 10
 CLIENT = {"ClientVersionString": "ipad-second-screen", "ProgName": "ipad-second-screen"}
 
 
@@ -79,9 +82,43 @@ def _send_msg(sock, lock, mtype, data):
         sock.sendall(struct.pack(">BI", mtype, len(data)) + data)
 
 
-def _session(sock, cap, on_message):
+def _authenticate(sock, lock, code, timeout=5):
+    """
+    Wi-Fi: verifica che dall'altra parte ci sia davvero l'app con questo codice di
+    abbinamento (risposta HMAC-SHA256 a un numero casuale). Evita che un altro
+    dispositivo in rete si finga l'iPad e muova il mouse del PC.
+    """
+    nonce = os.urandom(16).hex()
+    _send_msg(sock, lock, T_AUTH, json.dumps({"nonce": nonce}).encode())
+    expected = hmac.new(code.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+    sock.settimeout(timeout)
+    try:
+        while True:
+            mtype, length = struct.unpack(">BI", _recv_exact(sock, 5))
+            data = _recv_exact(sock, length) if length else b""
+            if mtype != T_JSON:
+                continue
+            try:
+                m = json.loads(data)
+            except ValueError:
+                continue
+            if m.get("t") == "auth":
+                return hmac.compare_digest(str(m.get("mac", "")), expected)
+            # altri messaggi prima della risposta (es. info) vengono ignorati
+    except (OSError, ConnectionError, struct.error):
+        return False
+    finally:
+        sock.settimeout(None)
+
+
+def _session(sock, cap, on_message, code=None):
     """Gestisce una connessione con l'app finché resta aperta."""
     lock = threading.Lock()
+    if code is not None and not _authenticate(sock, lock, code):
+        print("[!] codice di abbinamento errato o nessuna risposta: connessione rifiutata")
+        return False
+    if code is not None:
+        print("[+] iPad connesso via Wi-Fi (codice verificato)")
     ready = threading.Event()
     ready.set()
     alive = threading.Event()
@@ -126,6 +163,7 @@ def _session(sock, cap, on_message):
         except OSError:
             break
     alive.clear()
+    return True
 
 
 def run_usb(cap, on_message):
@@ -166,3 +204,39 @@ def run_usb(cap, on_message):
         except (OSError, ConnectionError) as e:
             status(f"[!] errore USB: {e}")
             time.sleep(2)
+
+
+def run_wifi(cap, on_message, host, code):
+    """Collegamento via Wi-Fi con l'app (si collega all'indirizzo IP dell'iPad)."""
+    print()
+    print(f"Modalità Wi-Fi (app): mi collego all'iPad {host}:{APP_PORT}.")
+    print("Apri l'app 'Secondo Schermo' sull'iPad. Ctrl+C per chiudere.")
+    print()
+    last_msg = None
+
+    def status(msg):
+        nonlocal last_msg
+        if msg != last_msg:
+            print(msg)
+            last_msg = msg
+
+    while True:
+        try:
+            sock = socket.create_connection((host, APP_PORT), timeout=3)
+        except OSError:
+            status(f"In attesa dell'app sull'iPad ({host})… stessa rete Wi-Fi e app aperta?")
+            time.sleep(2)
+            continue
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(None)
+        last_msg = None
+        try:
+            if _session(sock, cap, on_message, code=code):
+                print("[-] iPad scollegato")
+            else:
+                time.sleep(5)  # codice sbagliato: non insistere troppo
+        except (OSError, ConnectionError) as e:
+            status(f"[!] errore Wi-Fi: {e}")
+        finally:
+            sock.close()
+        time.sleep(1)

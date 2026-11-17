@@ -38,10 +38,12 @@ ICON_ICO = HERE / "icona.ico"
 BUILD_URL = "https://github.com/Pieruc/iPad-Second-Monitor/actions/workflows/build-ipad-app.yml"
 
 MODES = {"usb": "Cavo USB (app Secondo Schermo)",
+         "wifiapp": "Wi-Fi – app Secondo Schermo",
          "https": "Wi-Fi – Safari (HTTPS)",
          "http": "Wi-Fi – Safari (HTTP, senza certificato)"}
 DEFAULTS = {"mode": "usb", "fps": 30, "quality": 70, "scale": "1.0", "cursor_size": 1.0,
-            "no_dxcam": False, "draw_cursor": True, "manage_display": True}
+            "no_dxcam": False, "draw_cursor": True, "manage_display": True,
+            "ipad_ip": "", "ipad_code": ""}
 
 
 def python_console_exe():
@@ -98,6 +100,16 @@ class Panel:
         self.mode_var = tk.StringVar(value=self.settings["mode"])
         for key, label in MODES.items():
             ttk.Radiobutton(f, text=label, value=key, variable=self.mode_var).pack(anchor="w")
+            if key == "wifiapp":
+                # indirizzo e codice mostrati dall'app sull'iPad
+                w = ttk.Frame(f)
+                w.pack(anchor="w", padx=(22, 0), pady=(0, 2))
+                self.ip_var = tk.StringVar(value=self.settings["ipad_ip"])
+                self.code_var = tk.StringVar(value=self.settings["ipad_code"])
+                ttk.Label(w, text="IP iPad").pack(side="left")
+                ttk.Entry(w, textvariable=self.ip_var, width=15).pack(side="left", padx=(4, 10))
+                ttk.Label(w, text="Codice").pack(side="left")
+                ttk.Entry(w, textvariable=self.code_var, width=8).pack(side="left", padx=4)
 
         grid = ttk.Frame(f)
         grid.pack(fill="x", pady=(8, 4))
@@ -226,7 +238,8 @@ class Panel:
                              quality=self._int(self.quality_var, 70), scale=self.scale_var.get(),
                              cursor_size=self._float(self.cursor_var, 1.0),
                              no_dxcam=self.no_dxcam_var.get(), draw_cursor=self.draw_cursor_var.get(),
-                             manage_display=self.manage_var.get())
+                             manage_display=self.manage_var.get(),
+                             ipad_ip=self.ip_var.get().strip(), ipad_code=self.code_var.get().strip())
         try:
             SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2), encoding="utf-8")
         except OSError:
@@ -267,6 +280,11 @@ class Panel:
             return
         self._save_settings()
         s = self.settings
+        if s["mode"] == "wifiapp" and not (s["ipad_ip"] and s["ipad_code"].isdigit()
+                                           and len(s["ipad_code"]) == 6):
+            messagebox.showwarning("Wi-Fi", "Inserisci l'IP dell'iPad e il codice a 6 cifre: "
+                                            "li mostra l'app Secondo Schermo mentre aspetta il PC.")
+            return
         if s["manage_display"] and display.find_virtual() and not display.is_on():
             self.write_log("Accendo lo schermo virtuale…")
             if not display.turn_on():
@@ -278,6 +296,8 @@ class Panel:
                 "--scale", str(s["scale"]), "--cursor-size", str(s["cursor_size"])]
         if s["mode"] == "usb":
             args.append("--usb")
+        elif s["mode"] == "wifiapp":
+            args += ["--wifi-app", s["ipad_ip"], "--code", s["ipad_code"]]
         elif s["mode"] == "http":
             args.append("--http")
         if s["no_dxcam"]:

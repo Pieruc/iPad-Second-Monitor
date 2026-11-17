@@ -1,24 +1,37 @@
+import CryptoKit
 import Foundation
 import Network
 
-/// Collegamento con il PC tramite cavo USB.
+/// Collegamento con il PC, via cavo USB oppure via Wi-Fi.
 ///
-/// L'app resta in ascolto sulla porta 7878 dell'interfaccia locale (127.0.0.1).
-/// Il PC si collega attraverso il servizio Apple per l'USB (usbmuxd), che
-/// inoltra la connessione all'iPad lungo il cavo: niente Wi-Fi.
+/// L'app resta in ascolto sulla porta 7878:
+///  - via cavo il PC si collega attraverso il servizio Apple per l'USB (usbmuxd);
+///  - via Wi-Fi il PC si collega direttamente all'indirizzo IP dell'iPad.
+/// Per il Wi-Fi il PC chiede all'app di dimostrare di conoscere il "codice di
+/// abbinamento" (mostrato sullo schermo dell'iPad), così nessun altro dispositivo
+/// in rete può fingersi l'iPad e muovere il mouse del PC.
 ///
 /// Protocollo: ogni messaggio = 1 byte di tipo + 4 byte di lunghezza (big endian) + dati.
-///   PC -> iPad: 1 = hello (JSON), 2 = immagine JPEG
-///   iPad -> PC: 10 = messaggio JSON (tocchi, ack, info...)
+///   PC -> iPad: 1 = hello (JSON), 2 = immagine JPEG, 3 = sfida di autenticazione (JSON)
+///   iPad -> PC: 10 = messaggio JSON (tocchi, ack, info, risposta alla sfida...)
 final class Link {
     static let port: UInt16 = 7878
 
-    enum MsgType: UInt8 { case hello = 1, frame = 2, json = 10 }
+    enum MsgType: UInt8 { case hello = 1, frame = 2, auth = 3, json = 10 }
 
     var onState: ((String) -> Void)?
     var onHello: (([String: Any]) -> Void)?
     var onFrame: ((Data) -> Void)?
-    var onConnected: (() -> Void)?
+    var onConnected: ((_ viaUSB: Bool) -> Void)?
+    var onDisconnected: (() -> Void)?
+
+    /// Codice di abbinamento a 6 cifre, generato una volta e ricordato.
+    let pairingCode: String = {
+        if let c = UserDefaults.standard.string(forKey: "pairingCode") { return c }
+        let c = String(format: "%06d", Int.random(in: 0..<1_000_000))
+        UserDefaults.standard.set(c, forKey: "pairingCode")
+        return c
+    }()
 
     private let queue = DispatchQueue(label: "secondscreen.link")
     private var listener: NWListener?
@@ -35,19 +48,28 @@ final class Link {
         }
     }
 
+    /// Testo mostrato mentre si aspetta il PC.
+    func waitingText() -> String {
+        var s = "In attesa del PC…\nCavo: collega l'iPad e avvia il programma sul PC"
+        if let ip = Link.wifiAddress() {
+            s += "\nWi-Fi: indirizzo \(ip) · codice \(pairingCode)"
+        } else {
+            s += "\nWi-Fi: non connesso"
+        }
+        return s
+    }
+
     private func startListener() {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1",
-                                                 port: NWEndpoint.Port(rawValue: Link.port)!)
         do {
-            let l = try NWListener(using: params)
+            let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Link.port)!)
             l.newConnectionHandler = { [weak self] c in self?.accept(c) }
             l.stateUpdateHandler = { [weak self] state in
                 guard let self else { return }
                 switch state {
                 case .ready:
-                    self.report("In attesa del PC… collega il cavo e avvia il programma sul PC")
+                    if self.connection == nil { self.report(self.waitingText()) }
                 case .failed(let err):
                     self.report("Errore: \(err.localizedDescription). Riprovo…")
                     self.listener?.cancel()
@@ -65,20 +87,30 @@ final class Link {
         }
     }
 
+    private static func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+        if case let .hostPort(host, _) = endpoint {
+            let h = "\(host)"
+            return h.hasPrefix("127.") || h == "::1" || h.hasPrefix("::ffff:127.")
+        }
+        return false
+    }
+
     private func accept(_ c: NWConnection) {
         connection?.cancel()  // un solo PC alla volta: l'ultima connessione vince
         connection = c
+        let viaUSB = Link.isLoopback(c.endpoint)  // usbmuxd arriva dall'interfaccia locale
         c.stateUpdateHandler = { [weak self, weak c] state in
             guard let self, let c else { return }
             switch state {
             case .ready:
-                self.report("Connesso via cavo")
-                DispatchQueue.main.async { self.onConnected?() }
+                self.report(viaUSB ? "Connesso via cavo" : "Connesso via Wi-Fi")
+                DispatchQueue.main.async { self.onConnected?(viaUSB) }
                 self.readHeader(c)
             case .failed, .cancelled:
                 if self.connection === c {
                     self.connection = nil
-                    self.report("PC scollegato. In attesa…")
+                    self.report("PC scollegato.\n" + self.waitingText())
+                    DispatchQueue.main.async { self.onDisconnected?() }
                 }
             default:
                 break
@@ -123,6 +155,15 @@ final class Link {
             }
         case .frame:
             onFrame?(payload)  // decodificato fuori dal thread principale da chi lo riceve
+        case .auth:
+            // Il PC manda un numero casuale: rispondiamo con HMAC-SHA256(codice, numero)
+            if let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+               let nonce = obj["nonce"] as? String {
+                let key = SymmetricKey(data: Data(pairingCode.utf8))
+                let mac = HMAC<SHA256>.authenticationCode(for: Data(nonce.utf8), using: key)
+                let hex = mac.map { String(format: "%02x", $0) }.joined()
+                send(["t": "auth", "mac": hex])
+            }
         default:
             break
         }
@@ -143,5 +184,24 @@ final class Link {
 
     private func report(_ s: String) {
         DispatchQueue.main.async { self.onState?(s) }
+    }
+
+    /// Indirizzo IPv4 dell'iPad sulla rete Wi-Fi (interfaccia en0).
+    static func wifiAddress() -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        var result: String?
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let ifa = ptr.pointee
+            guard let addr = ifa.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET),
+                  String(cString: ifa.ifa_name) == "en0" else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count),
+                           nil, 0, NI_NUMERICHOST) == 0 {
+                result = String(cString: host)
+            }
+        }
+        return result
     }
 }

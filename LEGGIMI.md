@@ -53,3 +53,9 @@ Doppio clic su `Secondo Schermo.bat` (o su `pannello.pyw`): una finestra per avv
 il collegamento (cavo USB o Wi-Fi), accendere/spegnere lo schermo virtuale, cambiarne la
 risoluzione, modificare le risoluzioni del driver e riavviarlo. Il pulsante
 «Crea collegamento sul desktop» aggiunge un'icona per aprirlo.
+
+## App via Wi-Fi
+L'app mostra, mentre aspetta il PC, il suo **indirizzo Wi-Fi** e un **codice a 6 cifre**.
+Nel pannello scegli «Wi-Fi – app Secondo Schermo» e inseriscili (oppure
+`python server.py --wifi-app <IP> --code <codice>`). Il codice impedisce ad altri dispositivi
+in rete di fingersi l'iPad; l'immagine però viaggia non cifrata: usalo su reti di cui ti fidi.
