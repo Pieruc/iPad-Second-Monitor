@@ -14,3 +14,7 @@ ios/*.xcodeproj/
 ios/Payload/
 ios/SecondScreen/Info.plist
 *.ipa
+
+# Pannello
+pannello_settings.json
+icona.ico

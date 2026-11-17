@@ -47,3 +47,9 @@ Niente Wi-Fi: l'immagine passa dal cavo tramite il servizio Apple per l'USB.
    gratuito l'app va reinstallata ogni 7 giorni). Sull'iPad attiva la **Modalità sviluppatore**
    e autorizza il tuo Apple ID in Impostazioni → Generali → VPN e gestione dispositivi.
 4. Collega il cavo, avvia `avvia-usb.bat` e apri l'app **Secondo Schermo** sull'iPad.
+
+## Pannello di controllo
+Doppio clic su `Secondo Schermo.bat` (o su `pannello.pyw`): una finestra per avviare/fermare
+il collegamento (cavo USB o Wi-Fi), accendere/spegnere lo schermo virtuale, cambiarne la
+risoluzione, modificare le risoluzioni del driver e riavviarlo. Il pulsante
+«Crea collegamento sul desktop» aggiunge un'icona per aprirlo.
