@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Secondo Schermo">
+<title>Secondo Schermo</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #000; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none; touch-action: none;
+    overscroll-behavior: none;
+  }
+  /* cursor: none nasconde il puntatore dell'iPad (mouse/trackpad): resta solo quello del PC */
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: none; }
+  #status {
+    position: fixed; left: 50%; top: 16px; transform: translateX(-50%);
+    padding: 8px 14px; border-radius: 10px;
+    background: rgba(30,30,30,.85); color: #eee;
+    font: 14px -apple-system, system-ui, sans-serif;
+    transition: opacity .6s; pointer-events: none; z-index: 2;
+  }
+  #status.hidden { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="status">Connessione…</div>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const status = document.getElementById('status');
+  let ws = null;
+  let frameW = 0, frameH = 0;          // dimensioni del frame ricevuto
+  let view = { x: 0, y: 0, w: 1, h: 1 }; // rettangolo del frame sullo schermo (px CSS)
+  let fpsCount = 0, lastFpsT = performance.now(), fps = 0;
+  let hideTimer = null;
+  let drawCursor = true;
+  try { drawCursor = localStorage.getItem('drawCursor') !== '0'; } catch (_) {}
+
+  function showStatus(text, autoHide) {
+    status.textContent = text;
+    status.classList.remove('hidden');
+    clearTimeout(hideTimer);
+    if (autoHide) hideTimer = setTimeout(() => status.classList.add('hidden'), 2000);
+  }
+
+  // ---------- rendering ----------
+  function layout() {
+    const dpr = window.devicePixelRatio || 1;
+    const W = window.innerWidth, H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    if (frameW && frameH) {
+      const s = Math.min(W / frameW, H / frameH);
+      view.w = frameW * s; view.h = frameH * s;
+      view.x = (W - view.w) / 2; view.y = (H - view.h) / 2;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingQuality = 'high';
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+  }
+  window.addEventListener('resize', () => { layout(); if (lastBitmap) draw(lastBitmap); sendInfo(); });
+
+  // Comunica al PC la dimensione reale della finestra (in pixel fisici),
+  // così si può scegliere una risoluzione che la riempia esattamente.
+  function sendInfo() {
+    const dpr = window.devicePixelRatio || 1;
+    send({
+      t: 'info',
+      w: Math.round(window.innerWidth * dpr), h: Math.round(window.innerHeight * dpr), dpr,
+      fullscreen: !!(document.fullscreenElement || document.webkitFullscreenElement),
+      standalone: !!(window.navigator.standalone || matchMedia('(display-mode: standalone)').matches),
+      fsApi: !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen),
+      ua: navigator.userAgent,
+      wakeLock: typeof wakeState === 'undefined' ? '?' : wakeState,
+      video: typeof videoState === 'undefined' ? '?' : videoState,
+      secure: window.isSecureContext,
+    });
+  }
+
+  let lastBitmap = null;
+  function draw(bmp) {
+    if (bmp.width !== frameW || bmp.height !== frameH) {
+      frameW = bmp.width; frameH = bmp.height; layout();
+    }
+    ctx.drawImage(bmp, view.x, view.y, view.w, view.h);
+  }
+
+  // ---------- connessione ----------
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.binaryType = 'blob';
+    showStatus('Connessione…');
+
+    const sock = ws;
+    lastMsg = performance.now();
+    sock.onopen = () => {
+      showStatus('Connesso', true);
+      send({ t: 'cursor', on: drawCursor });
+      sendInfo();
+    };
+    sock.onmessage = async (ev) => {
+      lastMsg = performance.now();
+      if (typeof ev.data === 'string') return; // messaggio "hello"
+      try {
+        // se la decodifica si pianta (succede su iOS), non bloccare lo stream
+        const bmp = await Promise.race([
+          createImageBitmap(ev.data),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('decode timeout')), 3000)),
+        ]);
+        if (lastBitmap) lastBitmap.close();
+        lastBitmap = bmp;
+        draw(bmp);
+        fpsCount++;
+        const now = performance.now();
+        if (now - lastFpsT > 1000) { fps = fpsCount; fpsCount = 0; lastFpsT = now; }
+      } catch (e) { console.error(e); }
+      if (sock === ws) send({ t: 'ack' }); // pronto per il frame successivo
+    };
+    sock.onclose = () => {
+      if (sock !== ws) return; // vecchia connessione già sostituita
+      showStatus('Disconnesso – riconnessione…');
+      setTimeout(connect, 1000);
+    };
+    sock.onerror = () => sock.close();
+  }
+
+  // Watchdog: il server manda almeno un frame ogni ~2 s; se tace troppo, riconnetti
+  let lastMsg = performance.now();
+  function checkAlive() {
+    if (ws && ws.readyState === 1 && performance.now() - lastMsg > 7000) {
+      showStatus('Nessun segnale – riconnessione…');
+      ws.close();
+    }
+  }
+  setInterval(checkAlive, 2000);
+  document.addEventListener('visibilitychange', () => {
+    // al ritorno sull'app, iOS può aver lasciato il socket "zombie"
+    if (!document.hidden && ws && performance.now() - lastMsg > 3000) ws.close();
+  });
+
+  function send(obj) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  }
+
+  // coordinate schermo -> coordinate normalizzate (0..1) nel monitor del PC
+  function norm(clientX, clientY) {
+    return {
+      x: Math.min(Math.max((clientX - view.x) / view.w, 0), 1),
+      y: Math.min(Math.max((clientY - view.y) / view.h, 0), 1),
+    };
+  }
+
+  // ---------- gesti touch ----------
+  // 1 dito: tocco = click, trascina = trascinamento con tasto sinistro,
+  //         pressione lunga = click destro
+  // 2 dita: scorrimento
+  // 3 dita (tap): mostra info/FPS
+  const DRAG_THRESHOLD = 8;   // px
+  const LONG_PRESS_MS = 550;
+  let t1 = null;              // stato del gesto a un dito
+  let scroll = null;          // stato del gesto a due dita
+
+  function clearLongPress() { if (t1 && t1.timer) { clearTimeout(t1.timer); t1.timer = null; } }
+
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    const n = e.touches.length;
+    if (n === 1) {
+      const t = e.touches[0];
+      const p = norm(t.clientX, t.clientY);
+      t1 = { sx: t.clientX, sy: t.clientY, down: false, cancelled: false, timer: null, last: p };
+      send({ t: 'move', ...p });
+      t1.timer = setTimeout(() => {
+        if (t1 && !t1.down && !t1.cancelled) {
+          send({ t: 'click', b: 'right', ...t1.last });
+          t1.cancelled = true;
+          if (navigator.vibrate) navigator.vibrate(10);
+        }
+      }, LONG_PRESS_MS);
+    } else if (n === 2) {
+      // passa allo scroll: annulla l'eventuale trascinamento
+      if (t1) {
+        clearLongPress();
+        if (t1.down) send({ t: 'up', b: 'left', ...t1.last });
+        t1.cancelled = true;
+      }
+      const a = e.touches[0], b = e.touches[1];
+      scroll = { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 };
+    } else if (n === 3) {
+      if (t1) { clearLongPress(); t1.cancelled = true; }
+      scroll = null;
+      // tap con tre dita: attiva/disattiva il puntatore disegnato dal programma
+      drawCursor = !drawCursor;
+      try { localStorage.setItem('drawCursor', drawCursor ? '1' : '0'); } catch (_) {}
+      send({ t: 'cursor', on: drawCursor });
+      showStatus(`Puntatore disegnato: ${drawCursor ? 'sì' : 'no'} · ${frameW}×${frameH} · ${fps} fps`, true);
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    const n = e.touches.length;
+    if (n === 1 && t1 && !t1.cancelled) {
+      const t = e.touches[0];
+      const p = norm(t.clientX, t.clientY);
+      t1.last = p;
+      const moved = Math.hypot(t.clientX - t1.sx, t.clientY - t1.sy);
+      if (!t1.down && moved > DRAG_THRESHOLD) {
+        clearLongPress();
+        send({ t: 'down', b: 'left', ...norm(t1.sx, t1.sy) });
+        t1.down = true;
+      }
+      send({ t: 'move', ...p });
+    } else if (n === 2 && scroll) {
+      const a = e.touches[0], b = e.touches[1];
+      const x = (a.clientX + b.clientX) / 2, y = (a.clientY + b.clientY) / 2;
+      const dx = x - scroll.x, dy = y - scroll.y;
+      scroll.x = x; scroll.y = y;
+      // movimento naturale (come su iPad): trascinare in su scorre in giù
+      send({ t: 'scroll', dx: Math.round(-dx * 3), dy: Math.round(-dy * 3) });
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    if (e.touches.length === 0) {
+      if (t1 && !t1.cancelled) {
+        clearLongPress();
+        if (t1.down) send({ t: 'up', b: 'left', ...t1.last });
+        else send({ t: 'click', b: 'left', ...t1.last });
+      }
+      t1 = null; scroll = null;
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchcancel', () => {
+    if (t1) { clearLongPress(); if (t1.down) send({ t: 'up', b: 'left', ...t1.last }); }
+    t1 = null; scroll = null;
+  });
+
+  // ---------- mouse / trackpad (Magic Keyboard, o test dal PC) ----------
+  let mouseDown = null;
+  canvas.addEventListener('mousemove', (e) => send({ t: 'move', ...norm(e.clientX, e.clientY) }));
+  canvas.addEventListener('mousedown', (e) => {
+    mouseDown = e.button === 2 ? 'right' : 'left';
+    send({ t: 'down', b: mouseDown, ...norm(e.clientX, e.clientY) });
+  });
+  canvas.addEventListener('mouseup', (e) => {
+    send({ t: 'up', b: e.button === 2 ? 'right' : 'left', ...norm(e.clientX, e.clientY) });
+    mouseDown = null;
+  });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    send({ t: 'scroll', dx: Math.round(e.deltaX), dy: Math.round(e.deltaY) });
+  }, { passive: false });
+
+  // ---------- schermo sempre acceso ----------
+  // Funziona solo in HTTPS. Il blocco viene rilasciato quando la pagina va in
+  // background, quindi lo richiediamo di nuovo al ritorno e a ogni tocco.
+  let wakeLock = null;
+  let wakeState = 'non richiesto';
+
+  // Metodo di riserva: un video muto e invisibile in loop. iOS non va in standby
+  // mentre un video è in riproduzione (serve dove la Wake Lock API non funziona,
+  // per esempio in alcune versioni delle app aggiunte alla schermata Home).
+  const keepVideo = document.createElement('video');
+  keepVideo.src = '/static/nosleep.mp4';
+  keepVideo.muted = true;
+  keepVideo.loop = true;
+  keepVideo.playsInline = true;
+  keepVideo.setAttribute('muted', '');
+  keepVideo.setAttribute('playsinline', '');
+  keepVideo.setAttribute('aria-hidden', 'true');
+  keepVideo.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none;z-index:-1';
+  document.body.appendChild(keepVideo);
+  let videoState = 'fermo';
+  keepVideo.addEventListener('playing', () => { videoState = 'in riproduzione'; });
+  keepVideo.addEventListener('pause', () => { videoState = 'in pausa'; });
+
+  async function keepAwake() {
+    if (document.hidden) return;
+    if (keepVideo.paused) {
+      try { await keepVideo.play(); } catch (e) { videoState = 'bloccato: ' + e.name; }
+    }
+    if (wakeLock) return;
+    if (!('wakeLock' in navigator)) {
+      wakeState = window.isSecureContext ? 'non supportato' : 'serve https';
+      return;
+    }
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeState = 'attivo';
+      wakeLock.addEventListener('release', () => { wakeLock = null; wakeState = 'rilasciato'; });
+    } catch (e) { wakeLock = null; wakeState = 'errore: ' + e.name; }
+    sendInfo();
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) keepAwake(); });
+  document.addEventListener('touchend', keepAwake);
+  document.addEventListener('click', keepAwake);
+
+  // ---------- schermo intero (niente barre di Safari => niente bande nere) ----------
+  // Safari permette lo schermo intero solo dopo un tocco: lo attiviamo al primo tocco.
+  // Non serve se la pagina è aperta dall'icona sulla schermata Home (è già a tutto schermo).
+  const standalone = window.navigator.standalone || matchMedia('(display-mode: standalone)').matches;
+  let fsWanted = !standalone;
+  function enterFullscreen() {
+    if (!fsWanted) return;
+    if (document.fullscreenElement || document.webkitFullscreenElement) return;
+    const el = document.documentElement;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (!req) { fsWanted = false; return; } // non supportato
+    try {
+      const p = req.call(el);
+      if (p && p.catch) p.catch(() => {});
+    } catch (_) {}
+  }
+  // Se si esce dallo schermo intero, il tocco successivo lo riattiva.
+  function onFsChange() {
+    setTimeout(() => { layout(); if (lastBitmap) draw(lastBitmap); sendInfo(); }, 300);
+  }
+  document.addEventListener('fullscreenchange', onFsChange);
+  document.addEventListener('webkitfullscreenchange', onFsChange);
+  document.addEventListener('touchend', enterFullscreen);
+  document.addEventListener('click', enterFullscreen);
+
+  layout();
+  keepAwake();
+  connect();
+})();
+</script>
+</body>
+</html>

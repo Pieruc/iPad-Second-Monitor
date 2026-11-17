@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Configurazione</title>
+<style>
+  :root { --bg: #f5f5f7; --fg: #1d1d1f; --card: #fff; --muted: #6e6e73; --accent: #0071e3; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #000; --fg: #f5f5f7; --card: #1c1c1e; --muted: #98989d; --accent: #2997ff; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 17px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width: 620px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  p.lead { color: var(--muted); margin: 0 0 24px; }
+  .step { background: var(--card); border-radius: 14px; padding: 18px 20px; margin-bottom: 14px; }
+  .step h2 { font-size: 18px; margin: 0 0 6px; }
+  .step p, .step li { margin: 4px 0; color: var(--fg); }
+  .step ol { padding-left: 20px; margin: 6px 0 0; }
+  a.btn { display: inline-block; margin-top: 10px; padding: 11px 18px; border-radius: 10px;
+          background: var(--accent); color: #fff; text-decoration: none; font-weight: 600; }
+  .note { color: var(--muted); font-size: 15px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Configurazione iPad</h1>
+  <p class="lead">Da fare una sola volta, con <b>Safari</b> (Chrome non può installare certificati).
+  Serve perché Safari tenga lo schermo acceso solo su connessioni sicure (HTTPS).</p>
+
+  <div class="step">
+    <h2>1. Scarica il certificato</h2>
+    <p>Tocca il pulsante: deve comparire <i>“Questo sito web sta tentando di scaricare un profilo
+    di configurazione”</i>. Scegli <b>Consenti</b>, poi <b>Chiudi</b>.</p>
+    <a class="btn" href="/ca.mobileconfig">Scarica profilo</a>
+  </div>
+
+  <div class="step">
+    <h2>2. Installalo (entro 8 minuti)</h2>
+    <ol>
+      <li>Apri <b>Impostazioni</b>: in alto, sotto il tuo nome, c'è <b>Profilo scaricato</b>.
+        Se non c'è, vai in <b>Generali → VPN e gestione dispositivi</b>.</li>
+      <li>Tocca il profilo <b>iPad Second Screen</b> → <b>Installa</b> (in alto a destra) e
+        inserisci il codice dell'iPad. La scritta “Non verificato” è normale.</li>
+    </ol>
+    <p class="note">Se il profilo non compare, sono passati più di 8 minuti: scaricalo di nuovo.</p>
+  </div>
+
+  <div class="step">
+    <h2>3. Abilita la fiducia</h2>
+    <ol>
+      <li><b>Impostazioni → Generali → Info</b> → in fondo <b>Impostazioni certificati attendibili</b>.</li>
+      <li>Attiva <b>iPad Second Screen - CA locale</b>.</li>
+    </ol>
+  </div>
+
+  <div class="step">
+    <h2>4. Apri lo schermo</h2>
+    <p>Poi aggiungilo alla schermata Home da Condividi → <b>Aggiungi alla schermata Home</b>.</p>
+    <a class="btn" id="go" href="#">Apri secondo schermo</a>
+  </div>
+
+  <p class="note">Il certificato vale solo per indirizzi di rete locale (192.168.x, 10.x, 172.16–31.x),
+  quindi non può essere usato per siti internet. Per rimuoverlo: Impostazioni → Generali →
+  VPN e gestione dispositivi.</p>
+</main>
+<script>
+  const port = Number(location.port || 80) - 1;
+  document.getElementById('go').href = `https://${location.hostname}:${port}/`;
+</script>
+</body>
+</html>

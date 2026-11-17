@@ -1,0 +1,44 @@
+# Progetto Xcode generato con XcodeGen (https://github.com/yonaskolb/XcodeGen)
+# Il file .xcodeproj viene creato automaticamente da GitHub Actions.
+name: SecondScreen
+options:
+  bundleIdPrefix: local.secondscreen
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  SecondScreen:
+    type: application
+    platform: iOS
+    sources:
+      - SecondScreen
+    scheme: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.secondscreen.app
+        PRODUCT_NAME: SecondScreen
+        TARGETED_DEVICE_FAMILY: "2"          # solo iPad
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGNING_ALLOWED: NO             # la firma la fa Sideloadly sul PC
+        CODE_SIGNING_REQUIRED: NO
+    info:
+      path: SecondScreen/Info.plist
+      properties:
+        CFBundleDisplayName: Secondo Schermo
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIViewControllerBasedStatusBarAppearance: true
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default
+                UISceneDelegateClassName: $(PRODUCT_MODULE_NAME).SceneDelegate

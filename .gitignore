@@ -1,0 +1,16 @@
+# Certificati: contengono la chiave privata della CA locale, NON pubblicarli
+certs/
+
+# File locali generati dal programma
+display_state.json
+ipad_info.json
+__pycache__/
+*.bak
+*.bak2
+
+# Prodotti della compilazione iOS
+ios/build/
+ios/*.xcodeproj/
+ios/Payload/
+ios/SecondScreen/Info.plist
+*.ipa
