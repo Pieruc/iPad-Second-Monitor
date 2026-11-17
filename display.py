@@ -17,7 +17,7 @@ from pathlib import Path
 user32 = ctypes.windll.user32
 
 STATE_FILE = Path(__file__).parent / "display_state.json"
-DEFAULT_MODE = {"width": 1920, "height": 1080, "x": None, "y": 0}
+DEFAULT_MODE = {"width": 2360, "height": 1640, "x": None, "y": 0}
 
 DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x1
 DISPLAY_DEVICE_PRIMARY_DEVICE = 0x4

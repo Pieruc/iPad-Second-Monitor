@@ -339,7 +339,7 @@ class Capturer:
 
     def _loop(self):
         source = RobustSource(self.mon, self.use_dxcam)
-        print(f"Metodo di cattura: {source.name}")
+        print_once("capture", f"Metodo di cattura: {source.name}")
         last_img = None
         last_sent = 0.0
         last_geo_check = time.perf_counter()
@@ -411,6 +411,16 @@ async def index(request):
     return web.FileResponse(STATIC / "index.html")
 
 
+_last_printed = {}
+
+
+def print_once(key, text):
+    """Stampa `text` solo se è diverso dall'ultimo messaggio dello stesso tipo."""
+    if _last_printed.get(key) != text:
+        _last_printed[key] = text
+        print(text)
+
+
 def handle_client_message(m, cap, ctrl, cursor_allowed):
     """Gestisce un messaggio dall'iPad (web o app). Restituisce True se è un ack."""
     t = m.get("t")
@@ -421,10 +431,10 @@ def handle_client_message(m, cap, ctrl, cursor_allowed):
         info = {k: m.get(k) for k in ("w", "h", "dpr", "fullscreen", "standalone", "fsApi",
                                       "secure", "wakeLock", "video", "ua")}
         info["schermo_pc"] = f'{cap.mon["width"]}x{cap.mon["height"]}'
-        print(f'Finestra iPad: {info["w"]}x{info["h"]} '
-              f'(schermo intero: {"sì" if info["fullscreen"] or info["standalone"] else "no"}), '
-              f'schermo PC: {info["schermo_pc"]}, '
-              f'anti-standby: {info["wakeLock"]} / video {info["video"]}')
+        print_once("info", f'Finestra iPad: {info["w"]}x{info["h"]} '
+                   f'(schermo intero: {"sì" if info["fullscreen"] or info["standalone"] else "no"}), '
+                   f'schermo PC: {info["schermo_pc"]}, '
+                   f'anti-standby: {info["wakeLock"]} / video {info["video"]}')
         try:
             (Path(__file__).parent / "ipad_info.json").write_text(json.dumps(info, indent=2))
         except OSError:
