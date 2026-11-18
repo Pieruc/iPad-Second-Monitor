@@ -214,6 +214,8 @@ async def ws_handler(request):
                 for kind, data in msgs:
                     if kind == "json":
                         await ws.send_str(json.dumps(data))
+                    elif kind == "video":
+                        await ws.send_bytes(data)   # flusso continuo, senza conferme
                     else:
                         flow.on_send()
                         await ws.send_bytes(data)

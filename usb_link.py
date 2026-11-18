@@ -171,6 +171,9 @@ def _session(sock, cap, on_message, code=None):
             for kind, data in msgs:
                 if kind == "json":
                     _send_msg(sock, lock, T_CONTROL, json.dumps(data).encode())
+                elif kind == "video":
+                    # fotogrammi video: flusso continuo, senza attendere conferme
+                    _send_msg(sock, lock, T_VIDEO, data)
                 else:
                     flow.on_send()
                     t0 = time.monotonic()

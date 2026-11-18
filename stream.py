@@ -21,6 +21,8 @@ from ctypes import wintypes
 
 import mss
 import numpy as np
+
+from video_ffmpeg import FfmpegVideo
 from PIL import Image, ImageDraw
 
 user32 = ctypes.windll.user32
@@ -112,6 +114,22 @@ class MONITORINFO(ctypes.Structure):
                 ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
 
 
+def dxgi_location(mon):
+    """(indice scheda video, indice uscita) del monitor, come li vede DXGI; None se non trovato."""
+    try:
+        import dxcam
+        factory = getattr(dxcam, "__factory")
+        for d, outs in enumerate(factory.outputs):
+            for o_idx, o in enumerate(outs):
+                mi = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+                user32.GetMonitorInfoW(ctypes.c_void_p(o.hmonitor), ctypes.byref(mi))
+                if (mi.rcMonitor.left, mi.rcMonitor.top) == (mon["left"], mon["top"]):
+                    return d, o_idx
+    except Exception:
+        pass
+    return None
+
+
 class DxcamSource:
     """Cattura DXGI Desktop Duplication (veloce, riceve solo i frame cambiati)."""
     name = "dxcam (DXGI)"
@@ -130,6 +148,28 @@ class DxcamSource:
             raise RuntimeError("monitor non trovato da dxcam")
         self.cam = dxcam.create(device_idx=target[0], output_idx=target[1],
                                 processor_backend="numpy", output_color="BGRA")
+        self._wrap_duplicator()
+
+    def _wrap_duplicator(self):
+        """
+        Windows segnala un "nuovo fotogramma" anche quando si muove solo il mouse.
+        In quel caso (AccumulatedFrames == 0) lo schermo non è cambiato: evitiamo di
+        copiare e confrontare 15 MB di pixel.
+        """
+        dup = getattr(self.cam, "_duplicator", None)
+        if dup is None or getattr(dup, "_solo_puntatore", False):
+            return
+        orig = dup.update_frame
+
+        def update_frame(wait_for_frame=False):
+            ok = orig(wait_for_frame=wait_for_frame)
+            if ok and getattr(dup, "updated", False) and getattr(dup, "accumulated_frames", 1) == 0:
+                dup.release_frame()
+                dup.updated = False
+            return ok
+
+        dup.update_frame = update_frame
+        dup._solo_puntatore = True
 
     def close(self):
         try:
@@ -138,6 +178,7 @@ class DxcamSource:
             pass
 
     def grab(self):
+        self._wrap_duplicator()  # dxcam può ricreare il duplicatore (cambio risoluzione)
         arr = self.cam.grab()  # None se lo schermo non è cambiato
         if arr is None:
             return None, False
@@ -223,6 +264,7 @@ class Capturer:
         self.draw_cursor = draw_cursor
         self.use_dxcam = use_dxcam
         self.cursor_size = 1.0     # moltiplicatore (--cursor-size)
+        self.light = False         # True durante il video: cattura Python a 4 al secondo
         self.raw = None            # ultima schermata (numpy BGRA)
         self.frame_id = 0
         self.cursor = None         # (x, y) normalizzati 0..1, o None se fuori schermo
@@ -271,7 +313,11 @@ class Capturer:
                 if self._check_geometry():
                     source.close()
                     return  # _run ricrea la sorgente con le nuove dimensioni
-            img, changed = source.grab()
+            if self.light and t0 - getattr(self, "_last_grab", 0) < 0.25:
+                img, changed = None, False   # in video basta sapere se lo schermo si muove ancora
+            else:
+                self._last_grab = t0
+                img, changed = source.grab()
             cx, cy = cursor_pos()
             w, h = self.mon["width"], self.mon["height"]
             rx, ry = cx - self.mon["left"], cy - self.mon["top"]
@@ -301,7 +347,7 @@ class Capturer:
             if dt < self.interval:
                 time.sleep(self.interval - dt)
 
-    def wait_change(self, frame_id, cursor_id, want_frames, timeout):
+    def wait_change(self, frame_id, cursor_id, want_frames, timeout, extra=None):
         """
         Aspetta un nuovo frame (se want_frames) o un movimento del puntatore.
         want_frames può essere una funzione: viene rivalutata a ogni risveglio
@@ -309,7 +355,8 @@ class Capturer:
         """
         def ready():
             want = want_frames() if callable(want_frames) else want_frames
-            return (want and self.frame_id != frame_id) or self.cursor_id != cursor_id
+            return ((want and self.frame_id != frame_id) or self.cursor_id != cursor_id
+                    or (extra is not None and extra()))
         with self.cond:
             self.cond.wait_for(ready, timeout)
             return self.frame_id, self.raw, self.cursor_id, self.cursor
@@ -418,55 +465,6 @@ def change_fraction(old, new):
     return float((po[::4] != pn[::4]).mean())
 
 
-class NvencVideo:
-    """
-    Video H.264 compresso dalla scheda NVIDIA (NVENC). Riceve direttamente i pixel
-    BGRA: conversione dei colori e compressione le fa la GPU, non il processore.
-    Messaggio: b"V" + 1 byte (1 = fotogramma chiave) + flusso H.264 Annex B.
-    """
-    available = None  # None = non ancora provato
-
-    def __init__(self, width, height, fps, bitrate=10_000_000):
-        import fractions
-        import av
-        self.av = av
-        cc = av.CodecContext.create("h264_nvenc", "w")
-        cc.width, cc.height = width, height
-        cc.pix_fmt = "bgra"
-        cc.time_base = fractions.Fraction(1, fps)
-        cc.framerate = fps
-        cc.bit_rate = bitrate
-        cc.gop_size = fps * 4        # un fotogramma chiave ogni 4 s (ripresa da errori)
-        cc.max_b_frames = 0
-        cc.options = {"preset": "p1", "tune": "ull", "zerolatency": "1", "delay": "0",
-                      "profile": "high", "rc": "vbr", "maxrate": str(bitrate * 2)}
-        cc.open()
-        self.cc = cc
-        self.width, self.height = width, height
-        self.n = 0
-
-    def encode(self, raw):
-        frame = raw[:self.height, :self.width]
-        if not frame.flags["C_CONTIGUOUS"]:
-            frame = np.ascontiguousarray(frame)
-        vf = self.av.VideoFrame.from_ndarray(frame, format="bgra")
-        vf.pts = self.n
-        self.n += 1
-        packets = self.cc.encode(vf)
-        data = b"".join(bytes(p) for p in packets)
-        if not data:
-            return None
-        key = any(p.is_keyframe for p in packets)
-        return b"V" + bytes([1 if key else 0]) + data
-
-    def close(self):
-        try:
-            self.cc.encode(None)  # svuota il codificatore
-        except Exception:
-            pass
-        self.cc = None
-
-
 def encode_region(raw, x0, y0, x1, y1, quality, scale, draw=None):
     """Comprime in JPEG una zona della schermata. Restituisce (x, y, jpeg) in scala."""
     crop = np.ascontiguousarray(raw[y0:y1, x0:x1])
@@ -493,13 +491,18 @@ class StreamEncoder:
     VIDEO_ENTER_N = 3   # ...in almeno 3 aggiornamenti...
     VIDEO_WINDOW = 0.8  # ...nell'arco di 0,8 s
     VIDEO_STAY = 0.02   # resta in video finché cambia almeno il 2% dei pixel...
-    VIDEO_EXIT = 1.5    # ...altrimenti dopo 1,5 s torna alle zone (e la NVIDIA si riposa)
+    VIDEO_EXIT = 1.5    # ...altrimenti dopo 1,5 s torna alle zone
+    VIDEO_WARM = 60     # FFmpeg resta pronto 60 s dopo l'ultimo uso, poi si chiude
 
     def __init__(self, cap):
         self.cap = cap
         self.overlay = False
         self.video_ok = False     # il client sa decodificare H.264
-        self.video = None         # NvencVideo attivo
+        self.video = None         # FfmpegVideo (processo FFmpeg)
+        self.video_on = False     # si sta mandando video
+        self.video_pending = False
+        self.pending_since = 0.0
+        self.video_idle_since = 0.0
         self.big_changes = []     # istanti degli ultimi aggiornamenti "grandi"
         self.busy_at = 0.0
         self.last_raw = None
@@ -509,7 +512,7 @@ class StreamEncoder:
         self.last_cursor_msg = None
 
     def set_overlay(self, on, video=False):
-        self._stop_video()
+        self._video_off()
         self.video_ok = bool(on and video)
         self.overlay = bool(on)
         desc = ("zone + puntatore" if on else "immagini intere") + \
@@ -536,42 +539,84 @@ class StreamEncoder:
     def poll(self, can_send_frame, timeout):
         """
         Restituisce un elenco di messaggi da inviare:
-          ("json", dict) oppure ("bin", bytes)
-        Il messaggio binario (immagine) va inviato solo se can_send_frame.
+          ("json", dict), ("bin", bytes) oppure ("video", bytes)
+        "bin" va inviato solo se can_send_frame (controllo di flusso); "video" sempre.
         """
         cap = self.cap
+        video = self.video
+        extra = video.ready if (video is not None and (self.video_on or self.video_pending)) else None
         fid, raw, cid, cursor = cap.wait_change(self.frame_id, self.cursor_id,
-                                                can_send_frame, timeout)
+                                                can_send_frame, timeout, extra)
         if callable(can_send_frame):
             can_send_frame = can_send_frame()
         out = []
-        if self.overlay:
-            if cid != self.cursor_id:
-                self.cursor_id = cid
-                msg = self.cursor_message(cursor)
-                if msg != self.last_cursor_msg:
-                    self.last_cursor_msg = msg
-                    out.append(("json", msg))
-            if (can_send_frame and raw is not None and self.video is not None
-                    and fid == self.frame_id and time.monotonic() - self.busy_at > self.VIDEO_EXIT):
-                # lo schermo si è fermato: chiude il video e rimanda un'immagine nitida
-                self._stop_video()
-                self.last_raw = None
-                out.append(("bin", self._patches(raw)))
-            elif can_send_frame and raw is not None and fid != self.frame_id:
+        if not self.overlay:
+            if can_send_frame and raw is not None and (fid != self.frame_id or cid != self.cursor_id):
+                self.frame_id, self.cursor_id = fid, cid
+                out.append(("bin", self._full_with_cursor(raw, cursor)))
+            return out
+
+        now = time.monotonic()
+        if cid != self.cursor_id:
+            self.cursor_id = cid
+            msg = self.cursor_message(cursor)
+            if msg != self.last_cursor_msg:
+                self.last_cursor_msg = msg
+                out.append(("json", msg))
+
+        # il video era stato richiesto: appena FFmpeg manda il primo fotogramma chiave si passa al video
+        if self.video_pending and video is not None:
+            if video.ready():
+                self.video_pending = False
+                self.video_on = True
+                self.busy_at = now
+                cap.light = True
+                label = "Intel Quick Sync" if video.encoder == "h264_qsv" else "NVIDIA"
+                print_once("mode", f"Modalità: video H.264 ({label})")
+                status(force=True, modalita=f"video {label}", video_disponibile=True)
+            elif not video.alive() or now - self.pending_since > 6:
+                self._video_failed(video)
+
+        if self.video_on:
+            if raw is not None and fid != self.frame_id:
                 self.frame_id = fid
-                size = self.scaled_size(raw)
-                if size != self.size_sent:
-                    self.size_sent = size
-                    self.last_raw = None
-                    self._stop_video()
-                    out.append(("json", {"t": "size", "w": size[0], "h": size[1]}))
-                data = self._frame(raw)
-                if data:
-                    out.append(("bin", data))
-        elif can_send_frame and raw is not None and (fid != self.frame_id or cid != self.cursor_id):
-            self.frame_id, self.cursor_id = fid, cid
-            out.append(("bin", self._full_with_cursor(raw, cursor)))
+                if self.scaled_size(raw) != self.size_sent:
+                    self._video_off()
+                else:
+                    if change_fraction(self.last_raw, raw) >= self.VIDEO_STAY:
+                        self.busy_at = now
+                    self.last_raw = raw
+            if self.video_on and not video.alive():
+                self._video_failed(video)
+            elif self.video_on and now - self.busy_at > self.VIDEO_EXIT:
+                self._video_off()   # schermo fermo: torna alle zone
+            if self.video_on:
+                frames = video.pop_all()
+                if frames:
+                    status(fotogrammi_video=STATUS["fotogrammi_video"] + len(frames))
+                out.extend(("video", f) for f in frames)
+                return out
+            # uscita dal video: immagine intera nitida
+            self.last_raw = None
+            if raw is not None:
+                self.frame_id = fid
+                out.append(("bin", self._patches(raw)))
+            return out
+
+        if can_send_frame and raw is not None and fid != self.frame_id:
+            self.frame_id = fid
+            size = self.scaled_size(raw)
+            if size != self.size_sent:
+                self.size_sent = size
+                self.last_raw = None
+                out.append(("json", {"t": "size", "w": size[0], "h": size[1]}))
+            out.append(("bin", self._frame(raw)))
+
+        # FFmpeg tenuto pronto per un po' dopo l'uso, poi chiuso (risparmio)
+        if (video is not None and not self.video_on and not self.video_pending
+                and now - self.video_idle_since > self.VIDEO_WARM):
+            video.close()
+            self.video = None
         return out
 
     def keepalive(self):
@@ -581,71 +626,52 @@ class StreamEncoder:
         return None
 
     # ------------------------------------------------------------ video
-    def _stop_video(self):
+    def _video_off(self):
         if self.video is not None:
-            self.video.close()
-            self.video = None
+            self.video.deactivate()
+        if self.video_on or self.video_pending:
             print_once("mode", "Modalità: zone cambiate (JPEG)")
             status(force=True, modalita="zone JPEG")
+        self.video_on = False
+        self.video_pending = False
+        self.video_idle_since = time.monotonic()
+        self.cap.light = False
 
-    def _start_video(self, raw):
-        if NvencVideo.available is False:
-            return False
-        h, w = raw.shape[:2]
-        try:
-            self.video = NvencVideo(w - w % 2, h - h % 2, max(10, round(1 / self.cap.interval)))
-            NvencVideo.available = True
-            print_once("mode", "Modalità: video H.264 (NVIDIA)")
-            status(force=True, modalita="video NVIDIA", video_disponibile=True)
-            return True
-        except Exception as e:
-            NvencVideo.available = False
-            self.video = None
-            print(f"[!] video NVIDIA non disponibile ({e}): resto con le zone JPEG")
-            status(force=True, video_disponibile=False, ultimo_errore_video=str(e))
-            return False
+    def _video_failed(self, video):
+        err = video.error or "FFmpeg si è chiuso"
+        print(f"[!] video non disponibile ({err}): resto con le zone JPEG")
+        status(force=True, video_disponibile=False, ultimo_errore_video=err)
+        video.close()
+        self.video = None
+        self._video_off()
+        if FfmpegVideo.all_failed:
+            self.video_ok = False
+
+    def _request_video(self):
+        """Chiede a FFmpeg di iniziare a mandare video (intanto si continua con le zone)."""
+        if self.video is None or not self.video.alive():
+            loc = dxgi_location(self.cap.mon)
+            if loc is None:
+                self.video_ok = False
+                return
+            fps = max(10, round(1 / self.cap.interval))
+            self.video = FfmpegVideo(loc[0], loc[1], fps, 10_000_000, self.cap.kick)
+        self.video.activate()
+        self.video_pending = True
+        self.pending_since = time.monotonic()
 
     def _frame(self, raw):
         now = time.monotonic()
-        if self.video is not None:
-            frac = change_fraction(self.last_raw, raw)
-            self.last_raw = raw
-            if frac >= self.VIDEO_STAY:
-                self.busy_at = now
-            if now - self.busy_at <= self.VIDEO_EXIT:
-                try:
-                    t0 = time.perf_counter()
-                    data = self.video.encode(raw)
-                    if data:
-                        ms = (time.perf_counter() - t0) * 1000
-                        prev = STATUS.get("codifica_video_ms") or ms
-                        status(fotogrammi_video=STATUS["fotogrammi_video"] + 1,
-                               codifica_video_ms=round(prev * 0.8 + ms * 0.2, 1))
-                        return data
-                except Exception as e:
-                    print(f"[!] errore video: {e}")
-                    NvencVideo.available = False
-                    status(force=True, video_disponibile=False, ultimo_errore_video=str(e))
-            # fine del video: torna alle zone con un'immagine intera nitida
-            self._stop_video()
-            self.last_raw = None
-            return self._patches(raw)
-
         h, w = raw.shape[:2]
         rects = changed_rects(self.last_raw, raw)
         # area che andrebbe ricompressa in JPEG (conta più dei pixel cambiati:
         # scorrendo una pagina cambiano pochi pixel ma su quasi tutto lo schermo)
         area = 1.0 if rects is None else sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects) / (w * h)
-        if self.video_ok and NvencVideo.available is not False:
-            if area >= self.VIDEO_ENTER:
-                self.big_changes = [t for t in self.big_changes if now - t < self.VIDEO_WINDOW] + [now]
-                if len(self.big_changes) >= self.VIDEO_ENTER_N and self._start_video(raw):
-                    self.big_changes = []
-                    self.busy_at = now
-                    self.last_raw = raw
-                    data = self.video.encode(raw)
-                    if data:
-                        return data
+        if self.video_ok and not self.video_pending and not FfmpegVideo.all_failed and area >= self.VIDEO_ENTER:
+            self.big_changes = [t for t in self.big_changes if now - t < self.VIDEO_WINDOW] + [now]
+            if len(self.big_changes) >= self.VIDEO_ENTER_N:
+                self.big_changes = []
+                self._request_video()
         status(aggiornamenti_jpeg=STATUS["aggiornamenti_jpeg"] + 1, ultima_area_cambiata=round(area, 3))
         return self._patches(raw, rects)
 
