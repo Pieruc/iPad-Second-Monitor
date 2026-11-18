@@ -66,7 +66,7 @@
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, W, H);
   }
-  window.addEventListener('resize', () => { layout(); if (lastBitmap) draw(lastBitmap); sendInfo(); });
+  window.addEventListener('resize', () => { layout(); draw(); sendInfo(); });
 
   // Comunica al PC la dimensione reale della finestra (in pixel fisici),
   // così si può scegliere una risoluzione che la riempia esattamente.
@@ -85,45 +85,112 @@
     });
   }
 
-  let lastBitmap = null;
-  function draw(bmp) {
-    if (bmp.width !== frameW || bmp.height !== frameH) {
-      frameW = bmp.width; frameH = bmp.height; layout();
+  // Lo schermo del PC viene ricostruito su una tela nascosta: il PC manda solo le
+  // zone cambiate e la posizione del puntatore, che disegniamo noi.
+  const screenCanvas = document.createElement('canvas');
+  const sctx = screenCanvas.getContext('2d', { alpha: false });
+  let lastBitmap = null;       // solo per i server vecchi (immagini intere)
+  let cursorState = null;      // {x, y, v, s} dal PC
+
+  function setScreenSize(w, h) {
+    if (screenCanvas.width === w && screenCanvas.height === h) return;
+    screenCanvas.width = w; screenCanvas.height = h;
+    frameW = w; frameH = h; layout();
+  }
+
+  function drawPointer() {
+    const c = cursorState;
+    if (!c || !c.v) return;
+    const pts = [[0, 0], [0, 17], [4, 13], [7, 20], [10, 19], [7, 12], [12, 12]];
+    const k = (c.s * view.h) / 20;          // altezza freccia = s * altezza schermo
+    const x = view.x + c.x * view.w, y = view.y + c.y * view.h;
+    ctx.beginPath();
+    pts.forEach(([px, py], i) => (i ? ctx.lineTo : ctx.moveTo).call(ctx, x + px * k, y + py * k));
+    ctx.closePath();
+    ctx.fillStyle = '#fff'; ctx.fill();
+    ctx.lineWidth = Math.max(1, k * 0.9); ctx.strokeStyle = '#000'; ctx.stroke();
+  }
+
+  let composeQueued = false;
+  function compose() {           // disegna schermo + puntatore (al massimo una volta per frame)
+    if (composeQueued) return;
+    composeQueued = true;
+    requestAnimationFrame(() => {
+      composeQueued = false;
+      if (lastBitmap) ctx.drawImage(lastBitmap, view.x, view.y, view.w, view.h);
+      else if (screenCanvas.width) ctx.drawImage(screenCanvas, view.x, view.y, view.w, view.h);
+      drawPointer();
+    });
+  }
+  function draw() { compose(); }
+
+  function decode(blob) {
+    // se la decodifica si pianta (succede su iOS), non bloccare lo stream
+    return Promise.race([
+      createImageBitmap(blob),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('decode timeout')), 3000)),
+    ]);
+  }
+
+  async function applyPatches(buf) {
+    const dv = new DataView(buf);
+    const n = dv.getUint16(1, true);
+    let off = 3;
+    const jobs = [];
+    for (let i = 0; i < n; i++) {
+      const x = dv.getUint16(off, true), y = dv.getUint16(off + 2, true), len = dv.getUint32(off + 4, true);
+      off += 8;
+      const blob = new Blob([new Uint8Array(buf, off, len)], { type: 'image/jpeg' });
+      off += len;
+      jobs.push(decode(blob).then((bmp) => ({ x, y, bmp })));
     }
-    ctx.drawImage(bmp, view.x, view.y, view.w, view.h);
+    for (const { x, y, bmp } of await Promise.all(jobs)) {
+      sctx.drawImage(bmp, x, y);
+      bmp.close();
+    }
   }
 
   // ---------- connessione ----------
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.binaryType = 'blob';
+    ws.binaryType = 'arraybuffer';
     showStatus('Connessione…');
 
     const sock = ws;
     lastMsg = performance.now();
     sock.onopen = () => {
       showStatus('Connesso', true);
+      // questa pagina sa ricomporre le zone cambiate e disegnare il puntatore
+      send({ t: 'caps', patches: true, cursor: true });
       send({ t: 'cursor', on: drawCursor });
       sendInfo();
     };
     sock.onmessage = async (ev) => {
       lastMsg = performance.now();
-      if (typeof ev.data === 'string') return; // messaggio "hello"
+      if (typeof ev.data === 'string') {
+        let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+        if (m.t === 'size') setScreenSize(m.w, m.h);
+        else if (m.t === 'cur') { cursorState = m; compose(); }
+        return;
+      }
       try {
-        // se la decodifica si pianta (succede su iOS), non bloccare lo stream
-        const bmp = await Promise.race([
-          createImageBitmap(ev.data),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('decode timeout')), 3000)),
-        ]);
-        if (lastBitmap) lastBitmap.close();
-        lastBitmap = bmp;
-        draw(bmp);
+        const buf = ev.data;
+        if (new Uint8Array(buf, 0, 1)[0] === 0x50) {     // "P": zone cambiate
+          if (lastBitmap) { lastBitmap.close(); lastBitmap = null; }
+          await applyPatches(buf);
+        } else {                                          // immagine intera (server vecchio)
+          const bmp = await decode(new Blob([buf], { type: 'image/jpeg' }));
+          if (lastBitmap) lastBitmap.close();
+          lastBitmap = bmp;
+          if (bmp.width !== frameW || bmp.height !== frameH) { frameW = bmp.width; frameH = bmp.height; layout(); }
+        }
+        compose();
         fpsCount++;
         const now = performance.now();
         if (now - lastFpsT > 1000) { fps = fpsCount; fpsCount = 0; lastFpsT = now; }
       } catch (e) { console.error(e); }
-      if (sock === ws) send({ t: 'ack' }); // pronto per il frame successivo
+      if (sock === ws) send({ t: 'ack' }); // pronto per l'aggiornamento successivo
     };
     sock.onclose = () => {
       if (sock !== ws) return; // vecchia connessione già sostituita
@@ -326,7 +393,7 @@
   }
   // Se si esce dallo schermo intero, il tocco successivo lo riattiva.
   function onFsChange() {
-    setTimeout(() => { layout(); if (lastBitmap) draw(lastBitmap); sendInfo(); }, 300);
+    setTimeout(() => { layout(); draw(); sendInfo(); }, 300);
   }
   document.addEventListener('fullscreenchange', onFsChange);
   document.addEventListener('webkitfullscreenchange', onFsChange);

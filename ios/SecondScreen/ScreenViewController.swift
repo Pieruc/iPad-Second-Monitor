@@ -1,3 +1,4 @@
+import ImageIO
 import UIKit
 
 /// Mostra lo schermo del PC e trasforma i tocchi in eventi mouse.
@@ -10,6 +11,9 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
     private let imageView = UIImageView()
     private let statusLabel = PaddedLabel()
     private let decodeQueue = DispatchQueue(label: "secondscreen.decode")
+    private var canvas: CGContext?          // schermo del PC ricostruito (solo su decodeQueue)
+    private let pointerLayer = CAShapeLayer()
+    private var pointer: (x: CGFloat, y: CGFloat, visible: Bool, size: CGFloat)?
     private var hideStatusWork: DispatchWorkItem?
 
     private var frameSize = CGSize(width: 16, height: 9)
@@ -45,6 +49,12 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
         imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(imageView)
 
+        // puntatore disegnato qui: il PC manda solo la sua posizione
+        pointerLayer.fillColor = UIColor.white.cgColor
+        pointerLayer.strokeColor = UIColor.black.cgColor
+        pointerLayer.lineJoin = .round
+        view.layer.addSublayer(pointerLayer)
+
         statusLabel.textColor = .white
         statusLabel.font = .systemFont(ofSize: 15, weight: .medium)
         statusLabel.backgroundColor = UIColor(white: 0.12, alpha: 0.88)
@@ -67,11 +77,15 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
         link.onState = { [weak self] s in self?.showStatus(s, autoHide: s.hasPrefix("Connesso")) }
         link.onConnected = { [weak self] _ in
             guard let self else { return }
+            // questa app sa ricomporre le zone cambiate e disegnare il puntatore
+            self.link.send(["t": "caps", "patches": true, "cursor": true])
             self.link.send(["t": "cursor", "on": self.drawCursor])
             self.sendInfo()
         }
         link.onHello = { _ in }
         link.onFrame = { [weak self] data in self?.decode(data) }
+        link.onPatches = { [weak self] data in self?.applyPatches(data) }
+        link.onControl = { [weak self] msg in self?.handleControl(msg) }
         showStatus("Avvio…", autoHide: false)
         link.start()
     }
@@ -83,6 +97,94 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         sendInfo()
+        updatePointer()
+    }
+
+    // MARK: zone cambiate e puntatore
+
+    private func handleControl(_ m: [String: Any]) {
+        switch m["t"] as? String {
+        case "size":
+            guard let w = m["w"] as? Int, let h = m["h"] as? Int, w > 0, h > 0 else { return }
+            decodeQueue.async { self.makeCanvas(width: w, height: h) }
+        case "cur":
+            let x = (m["x"] as? Double) ?? 0, y = (m["y"] as? Double) ?? 0
+            let s = (m["s"] as? Double) ?? 0.025
+            pointer = (CGFloat(x), CGFloat(y), (m["v"] as? Bool) ?? false, CGFloat(s))
+            updatePointer()
+        default:
+            break
+        }
+    }
+
+    /// Solo su decodeQueue.
+    private func makeCanvas(width: Int, height: Int) {
+        if let c = canvas, c.width == width, c.height == height { return }
+        canvas = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                           bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                           bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+        canvas?.setFillColor(UIColor.black.cgColor)
+        canvas?.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    }
+
+    private func applyPatches(_ data: Data) {
+        decodeQueue.async { [weak self] in
+            guard let self else { return }
+            let bytes = [UInt8](data)
+            func u16(_ i: Int) -> Int { Int(bytes[i]) | Int(bytes[i + 1]) << 8 }
+            func u32(_ i: Int) -> Int { u16(i) | u16(i + 2) << 16 }
+            var image: CGImage?
+            if bytes.count >= 3, bytes[0] == 0x50 {
+                let n = u16(1)
+                var off = 3
+                for _ in 0..<n {
+                    guard off + 8 <= bytes.count else { break }
+                    let x = u16(off), y = u16(off + 2), len = u32(off + 4)
+                    off += 8
+                    guard off + len <= bytes.count else { break }
+                    let jpeg = data.subdata(in: data.startIndex + off ..< data.startIndex + off + len)
+                    off += len
+                    guard let src = CGImageSourceCreateWithData(jpeg as CFData, nil),
+                          let patch = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+                    if self.canvas == nil && x == 0 && y == 0 {
+                        self.makeCanvas(width: patch.width, height: patch.height)
+                    }
+                    guard let c = self.canvas else { continue }
+                    // CGContext ha l'origine in basso a sinistra
+                    c.draw(patch, in: CGRect(x: x, y: c.height - y - patch.height,
+                                             width: patch.width, height: patch.height))
+                }
+                image = self.canvas?.makeImage()
+            }
+            DispatchQueue.main.async {
+                if let image {
+                    self.imageView.image = UIImage(cgImage: image)
+                    self.frameSize = CGSize(width: image.width, height: image.height)
+                    self.updatePointer()
+                    self.countFrame()
+                }
+                self.link.send(["t": "ack"])  // pronto per l'aggiornamento successivo
+            }
+        }
+    }
+
+    private func updatePointer() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard let p = pointer, p.visible else { pointerLayer.path = nil; return }
+        let r = imageRect
+        let k = p.size * r.height / 20
+        let origin = CGPoint(x: r.minX + p.x * r.width, y: r.minY + p.y * r.height)
+        let pts: [(CGFloat, CGFloat)] = [(0, 0), (0, 17), (4, 13), (7, 20), (10, 19), (7, 12), (12, 12)]
+        let path = UIBezierPath()
+        for (i, pt) in pts.enumerated() {
+            let q = CGPoint(x: origin.x + pt.0 * k, y: origin.y + pt.1 * k)
+            if i == 0 { path.move(to: q) } else { path.addLine(to: q) }
+        }
+        path.close()
+        pointerLayer.lineWidth = max(1, k * 0.9)
+        pointerLayer.path = path.cgPath
     }
 
     // MARK: immagini

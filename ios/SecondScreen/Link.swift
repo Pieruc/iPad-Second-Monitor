@@ -12,16 +12,19 @@ import Network
 /// in rete può fingersi l'iPad e muovere il mouse del PC.
 ///
 /// Protocollo: ogni messaggio = 1 byte di tipo + 4 byte di lunghezza (big endian) + dati.
-///   PC -> iPad: 1 = hello (JSON), 2 = immagine JPEG, 3 = sfida di autenticazione (JSON)
+///   PC -> iPad: 1 = hello (JSON), 2 = immagine JPEG intera, 3 = sfida di autenticazione (JSON),
+///               4 = zone cambiate dello schermo, 5 = controllo (JSON: puntatore, dimensioni)
 ///   iPad -> PC: 10 = messaggio JSON (tocchi, ack, info, risposta alla sfida...)
 final class Link {
     static let port: UInt16 = 7878
 
-    enum MsgType: UInt8 { case hello = 1, frame = 2, auth = 3, json = 10 }
+    enum MsgType: UInt8 { case hello = 1, frame = 2, auth = 3, patches = 4, control = 5, json = 10 }
 
     var onState: ((String) -> Void)?
     var onHello: (([String: Any]) -> Void)?
     var onFrame: ((Data) -> Void)?
+    var onPatches: ((Data) -> Void)?
+    var onControl: (([String: Any]) -> Void)?
     var onConnected: ((_ viaUSB: Bool) -> Void)?
     var onDisconnected: (() -> Void)?
 
@@ -155,6 +158,12 @@ final class Link {
             }
         case .frame:
             onFrame?(payload)  // decodificato fuori dal thread principale da chi lo riceve
+        case .patches:
+            onPatches?(payload)
+        case .control:
+            if let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] {
+                DispatchQueue.main.async { self.onControl?(obj) }
+            }
         case .auth:
             // Il PC manda un numero casuale: rispondiamo con HMAC-SHA256(codice, numero)
             if let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],

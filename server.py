@@ -140,265 +140,7 @@ class InputController:
 # --------------------------------------------------------------------------- #
 # Cattura schermo
 # --------------------------------------------------------------------------- #
-class POINT(ctypes.Structure):
-    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
-
-
-def cursor_pos():
-    p = POINT()
-    user32.GetCursorPos(ctypes.byref(p))
-    return p.x, p.y
-
-
-# Freccia del cursore (viene ingrandita in base alla risoluzione del monitor)
-CURSOR_SHAPE = [(0, 0), (0, 17), (4, 13), (7, 20), (10, 19), (7, 12), (12, 12)]
-
-
-def cursor_polygon(x, y, k):
-    return [(x + px * k, y + py * k) for px, py in CURSOR_SHAPE]
-
-
-class MssSource:
-    """Cattura GDI (sempre disponibile, più lenta ma affidabile)."""
-    name = "mss (GDI)"
-
-    def __init__(self, mon):
-        self.mon = mon
-        self.sct = _MSS()
-        self.crc = None
-
-    def grab_always(self):
-        shot = self.sct.grab(self.mon)
-        return Image.frombuffer("RGB", shot.size, shot.bgra, "raw", "BGRX", 0, 1).copy()
-
-    def grab(self):
-        shot = self.sct.grab(self.mon)
-        raw = shot.bgra
-        crc = zlib.crc32(raw)
-        if crc == self.crc:
-            return None, False
-        self.crc = crc
-        return Image.frombuffer("RGB", shot.size, raw, "raw", "BGRX", 0, 1), True
-
-
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
-
-
-class DxcamSource:
-    """Cattura DXGI Desktop Duplication (veloce, riceve solo i frame cambiati)."""
-    name = "dxcam (DXGI)"
-
-    def __init__(self, mon):
-        import dxcam
-        factory = getattr(dxcam, "__factory")  # getattr evita il name-mangling di Python
-        target = None
-        for d, outs in enumerate(factory.outputs):
-            for o_idx, o in enumerate(outs):
-                mi = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
-                user32.GetMonitorInfoW(ctypes.c_void_p(o.hmonitor), ctypes.byref(mi))
-                if (mi.rcMonitor.left, mi.rcMonitor.top) == (mon["left"], mon["top"]):
-                    target = (d, o_idx)
-        if target is None:
-            raise RuntimeError("monitor non trovato da dxcam")
-        self.cam = dxcam.create(device_idx=target[0], output_idx=target[1],
-                                processor_backend="numpy", output_color="BGRA")
-
-    def close(self):
-        try:
-            self.cam.release()  # permette di ricrearla con una nuova risoluzione
-        except Exception:
-            pass
-
-    def grab(self):
-        arr = self.cam.grab()  # None se lo schermo non è cambiato
-        if arr is None:
-            return None, False
-        # La conversione BGRA -> RGB la fa Pillow (in C, molto più leggera di quella di dxcam)
-        if not arr.flags["C_CONTIGUOUS"]:
-            import numpy as np
-            arr = np.ascontiguousarray(arr)
-        h, w = arr.shape[:2]
-        return Image.frombuffer("RGB", (w, h), arr, "raw", "BGRX", 0, 1), True
-
-
-def _thumb_diff(a, b):
-    """Differenza media (0-255) tra due immagini, calcolata su miniature."""
-    size = (64, 36)
-    d = ImageChops.difference(a.resize(size), b.resize(size))
-    return sum(ImageStat.Stat(d).mean) / 3
-
-
-class RobustSource:
-    """
-    Usa dxcam se possibile, ma controlla periodicamente con mss che non si sia
-    "congelato" (succede con schermi virtuali / doppia GPU). In caso di errori o
-    blocchi passa definitivamente a mss, così lo streaming non si ferma.
-    """
-    CHECK_EVERY = 2.0  # secondi senza frame da dxcam prima di verificare
-
-    def __init__(self, mon, use_dxcam=True):
-        self.mon = mon
-        self.mss = MssSource(mon)
-        self.dx = None
-        if use_dxcam:
-            try:
-                self.dx = DxcamSource(mon)
-            except Exception as e:
-                print(f"dxcam non disponibile ({e}); uso mss")
-        self.last = None
-        self.last_new = time.monotonic()
-
-    @property
-    def name(self):
-        return self.dx.name if self.dx else self.mss.name
-
-    def close(self):
-        if self.dx:
-            self.dx.close()
-
-    def _fallback(self, why):
-        print(f"[!] dxcam {why}: passo alla cattura mss")
-        self.dx = None
-
-    def grab(self):
-        if self.dx is None:
-            img, changed = self.mss.grab()
-        else:
-            try:
-                img, changed = self.dx.grab()
-            except Exception as e:
-                self._fallback(f"errore ({e})")
-                img, changed = self.mss.grab()
-            else:
-                now = time.monotonic()
-                if changed:
-                    self.last_new = now
-                elif self.last is not None and now - self.last_new > self.CHECK_EVERY:
-                    # dxcam non dà frame da un po': lo schermo è davvero fermo?
-                    self.last_new = now
-                    real = self.mss.grab_always()
-                    if _thumb_diff(real, self.last) > 3:
-                        self._fallback("bloccato")
-                        img, changed = real, True
-        if img is not None:
-            self.last = img
-        return img, changed
-
-
-class Capturer:
-    """Cattura il monitor in un thread dedicato; tiene sempre l'ultimo JPEG pronto."""
-
-    def __init__(self, mon, fps, quality, scale, draw_cursor=True, use_dxcam=True, rect_fn=None):
-        self.mon = mon             # dict condiviso con InputController: aggiornato sul posto
-        self.rect_fn = rect_fn     # restituisce il rettangolo attuale del monitor (o None)
-        self.interval = 1.0 / fps
-        self.quality = quality
-        self.scale = scale
-        self.draw_cursor = draw_cursor
-        self.use_dxcam = use_dxcam
-        # Cursore grande abbastanza da vedersi sull'iPad (~2x a 768p, ~4x a 1640p)
-        self.cursor_size = 1.0  # moltiplicatore (--cursor-size)
-        self.cursor_k = self._cursor_scale()
-        self.frame = None          # bytes JPEG
-        self.frame_id = 0
-        self.cond = threading.Condition()
-        self.running = True
-        self._last_sig = None
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def _run(self):
-        # Se il ciclo va in errore lo riavvia, invece di lasciare lo schermo congelato
-        while self.running:
-            try:
-                self._loop()
-            except Exception as e:
-                print(f"[!] errore di cattura, riavvio: {e!r}")
-                time.sleep(0.5)
-
-    def _cursor_scale(self):
-        # Circa 2x a 1640 righe (come un puntatore di Windows al 200%)
-        return max(1.0, self.mon["height"] / 800) * self.cursor_size
-
-    def _check_geometry(self):
-        """True se risoluzione/posizione del monitor sono cambiate (e aggiorna self.mon)."""
-        if self.rect_fn is None:
-            return False
-        try:
-            r = self.rect_fn()
-        except Exception:
-            return False
-        keys = ("left", "top", "width", "height")
-        if not r or all(r[k] == self.mon[k] for k in keys):
-            return False
-        self.mon.update({k: r[k] for k in keys})
-        self.cursor_k = self._cursor_scale()
-        print(f"Schermo cambiato: ora {r['width']}x{r['height']} @ ({r['left']},{r['top']})")
-        return True
-
-    def _loop(self):
-        source = RobustSource(self.mon, self.use_dxcam)
-        print_once("capture", f"Metodo di cattura: {source.name}")
-        last_img = None
-        last_sent = 0.0
-        last_geo_check = time.perf_counter()
-        while self.running:
-            t0 = time.perf_counter()
-            if t0 - last_geo_check > 1.0:
-                last_geo_check = t0
-                if self._check_geometry():
-                    source.close()
-                    return  # _run ricrea la sorgente con le nuove dimensioni
-            img, changed = source.grab()  # img: PIL RGB (o None se invariato)
-            if img is not None:
-                last_img = img
-            cx, cy = cursor_pos()
-            rel = (cx - self.mon["left"], cy - self.mon["top"])
-            inside = 0 <= rel[0] < self.mon["width"] and 0 <= rel[1] < self.mon["height"]
-            cur = rel if (inside and self.draw_cursor) else None
-
-            # invia se cambia lo schermo o il cursore, e comunque ogni 2 s (keep-alive)
-            if last_img is not None and (changed or cur != self._last_sig or t0 - last_sent > 2):
-                self._last_sig = cur
-                last_sent = t0
-                out = last_img
-                patch = None
-                if cur is not None:
-                    # Disegna il puntatore direttamente sull'immagine salvando solo il
-                    # pezzetto sotto di esso (evita di copiare tutto lo schermo)
-                    k = self.cursor_k
-                    pts = cursor_polygon(cur[0], cur[1], k)
-                    pad = int(k) + 2
-                    box = (max(0, int(min(x for x, _ in pts)) - pad),
-                           max(0, int(min(y for _, y in pts)) - pad),
-                           min(out.width, int(max(x for x, _ in pts)) + pad),
-                           min(out.height, int(max(y for _, y in pts)) + pad))
-                    patch = (out.crop(box), box)
-                    ImageDraw.Draw(out).polygon(pts, fill="white", outline="black",
-                                                width=max(1, int(k)))
-                enc = out
-                if self.scale != 1.0:
-                    enc = out.resize((int(out.width * self.scale), int(out.height * self.scale)),
-                                     Image.BILINEAR)
-                buf = io.BytesIO()
-                enc.save(buf, "JPEG", quality=self.quality)
-                if patch is not None:
-                    out.paste(*patch)  # ripristina l'immagine originale
-                with self.cond:
-                    self.frame = buf.getvalue()
-                    self.frame_id += 1
-                    self.cond.notify_all()
-
-            dt = time.perf_counter() - t0
-            if dt < self.interval:
-                time.sleep(self.interval - dt)
-
-    def wait_new(self, last_id, timeout=1.0):
-        with self.cond:
-            if self.frame_id == last_id:
-                self.cond.wait(timeout)
-            return self.frame_id, self.frame
+from stream import Capturer, StreamEncoder, print_once  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -409,16 +151,6 @@ STATIC = Path(__file__).parent / "static"
 
 async def index(request):
     return web.FileResponse(STATIC / "index.html")
-
-
-_last_printed = {}
-
-
-def print_once(key, text):
-    """Stampa `text` solo se è diverso dall'ultimo messaggio dello stesso tipo."""
-    if _last_printed.get(key) != text:
-        _last_printed[key] = text
-        print(text)
 
 
 def handle_client_message(m, cap, ctrl, cursor_allowed):
@@ -466,24 +198,28 @@ async def ws_handler(request):
     }))
 
     loop = asyncio.get_running_loop()
-    ready = asyncio.Event()
-    ready.set()  # il client è pronto a ricevere il primo frame
+    enc = StreamEncoder(cap)
+    request["encoder"] = enc
+    state = {"ready": True, "sent_at": time.monotonic(), "keep": time.monotonic()}
 
     async def sender():
-        last = 0
         while not ws.closed:
+            now = time.monotonic()
+            if not state["ready"] and now - state["sent_at"] > 3:
+                state["ready"] = True   # ack perso: si riparte comunque
+            msgs = await loop.run_in_executor(None, enc.poll, state["ready"], 0.5)
+            if not msgs and now - state["keep"] > 2:
+                ka = enc.keepalive()
+                msgs = [ka] if ka else []
             try:
-                # se l'ack si perde, dopo 3 s si riparte comunque
-                await asyncio.wait_for(ready.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                pass
-            fid, data = await loop.run_in_executor(None, cap.wait_new, last, 1.0)
-            if data is None or fid == last:
-                continue
-            last = fid
-            ready.clear()
-            try:
-                await ws.send_bytes(data)
+                for kind, data in msgs:
+                    if kind == "json":
+                        await ws.send_str(json.dumps(data))
+                    else:
+                        state["ready"] = False
+                        state["sent_at"] = time.monotonic()
+                        await ws.send_bytes(data)
+                    state["keep"] = time.monotonic()
             except Exception:
                 break
 
@@ -495,8 +231,10 @@ async def ws_handler(request):
                     m = json.loads(msg.data)
                 except ValueError:
                     continue
-                if handle_client_message(m, cap, ctrl, app["cursor_allowed"]):
-                    ready.set()
+                if m.get("t") == "caps":
+                    enc.set_overlay(m.get("patches") and m.get("cursor"))
+                elif handle_client_message(m, cap, ctrl, app["cursor_allowed"]):
+                    state["ready"] = True
             elif msg.type == WSMsgType.ERROR:
                 break
     finally:
@@ -644,7 +382,6 @@ def main():
     app["capturer"] = Capturer(mon, args.fps, args.quality, args.scale, not args.no_cursor,
                                not args.no_dxcam, rect_fn)
     app["capturer"].cursor_size = args.cursor_size
-    app["capturer"].cursor_k = app["capturer"]._cursor_scale()
     app["input"] = InputController(mon)
     app["cursor_allowed"] = not args.no_cursor
     app.router.add_get("/", index)

@@ -23,7 +23,7 @@ import time
 
 USBMUXD = ("127.0.0.1", 27015)
 APP_PORT = 7878
-T_HELLO, T_FRAME, T_AUTH, T_JSON = 1, 2, 3, 10
+T_HELLO, T_FRAME, T_AUTH, T_PATCH, T_CONTROL, T_JSON = 1, 2, 3, 4, 5, 10
 CLIENT = {"ClientVersionString": "ipad-second-screen", "ProgName": "ipad-second-screen"}
 
 
@@ -119,8 +119,9 @@ def _session(sock, cap, on_message, code=None):
         return False
     if code is not None:
         print("[+] iPad connesso via Wi-Fi (codice verificato)")
-    ready = threading.Event()
-    ready.set()
+    from stream import StreamEncoder
+    enc = StreamEncoder(cap)
+    state = {"ready": True, "sent_at": time.monotonic()}
     alive = threading.Event()
     alive.set()
 
@@ -138,28 +139,36 @@ def _session(sock, cap, on_message, code=None):
                     m = json.loads(data)
                 except ValueError:
                     continue
-                if on_message(m):
-                    ready.set()  # l'app ha mostrato l'immagine: si può inviare la prossima
+                if m.get("t") == "caps":
+                    # app aggiornata: zone cambiate + puntatore disegnato sull'iPad
+                    enc.set_overlay(m.get("patches") and m.get("cursor"))
+                elif on_message(m):
+                    state["ready"] = True  # l'app ha mostrato l'immagine
         except (OSError, ConnectionError, struct.error):
             pass
         finally:
             alive.clear()
-            ready.set()
 
     threading.Thread(target=receiver, daemon=True).start()
 
-    last = 0
+    keep = time.monotonic()
     while alive.is_set():
-        ready.wait(timeout=3)  # se l'ack si perde, dopo 3 s si riparte comunque
-        if not alive.is_set():
-            break
-        fid, data = cap.wait_new(last, 1.0)
-        if data is None or fid == last:
-            continue
-        last = fid
-        ready.clear()
+        now = time.monotonic()
+        if not state["ready"] and now - state["sent_at"] > 3:
+            state["ready"] = True  # se l'ack si perde, dopo 3 s si riparte comunque
+        msgs = enc.poll(state["ready"], 0.5)
+        if not msgs and now - keep > 2:
+            ka = enc.keepalive()
+            msgs = [ka] if ka else []
         try:
-            _send_msg(sock, lock, T_FRAME, data)
+            for kind, data in msgs:
+                if kind == "json":
+                    _send_msg(sock, lock, T_CONTROL, json.dumps(data).encode())
+                else:
+                    state["ready"] = False
+                    state["sent_at"] = time.monotonic()
+                    _send_msg(sock, lock, T_PATCH if enc.overlay else T_FRAME, data)
+                keep = time.monotonic()
         except OSError:
             break
     alive.clear()

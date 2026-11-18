@@ -109,6 +109,15 @@ def _apply(name, width, height, x, y):
     return user32.ChangeDisplaySettingsExW(None, None, None, 0, None)
 
 
+def _wait_on(timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        if is_on():
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def turn_off():
     """Stacca lo schermo virtuale dal desktop, ricordando risoluzione e posizione."""
     dd = find_virtual()
@@ -139,7 +148,15 @@ def turn_on(timeout=5.0):
         pm = _current_mode(p.DeviceName) if p else None
         mode["x"] = pm.dmPelsWidth if pm else 1920
     r = _apply(dd.DeviceName, mode["width"], mode["height"], mode["x"], mode["y"])
-    if r != DISP_CHANGE_SUCCESSFUL:
+    if r != DISP_CHANGE_SUCCESSFUL or not _wait_on(1.5):
+        # Se Windows è in "Solo schermo del PC" (Win+P) il metodo classico non basta:
+        # chiediamo la modalità "Estendi", come fa Win+P, poi ripristiniamo risoluzione/posizione.
+        SDC_APPLY, SDC_TOPOLOGY_EXTEND = 0x80, 0x4
+        user32.SetDisplayConfig(0, None, 0, None, SDC_APPLY | SDC_TOPOLOGY_EXTEND)
+        if _wait_on(timeout):
+            dd = find_virtual()
+            _apply(dd.DeviceName, mode["width"], mode["height"], mode["x"], mode["y"])
+    if not is_on():
         # risoluzione salvata non più disponibile (es. tolta dal driver): usa la più grande
         modes = available_modes()
         if modes:
