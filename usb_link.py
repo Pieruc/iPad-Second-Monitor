@@ -82,7 +82,7 @@ def _send_msg(sock, lock, mtype, data):
         sock.sendall(struct.pack(">BI", mtype, len(data)) + data)
 
 
-def _authenticate(sock, lock, code, timeout=5):
+def _authenticate(sock, lock, code, early, timeout=5):
     """
     Wi-Fi: verifica che dall'altra parte ci sia davvero l'app con questo codice di
     abbinamento (risposta HMAC-SHA256 a un numero casuale). Evita che un altro
@@ -104,7 +104,9 @@ def _authenticate(sock, lock, code, timeout=5):
                 continue
             if m.get("t") == "auth":
                 return hmac.compare_digest(str(m.get("mac", "")), expected)
-            # altri messaggi prima della risposta (es. info) vengono ignorati
+            # messaggi arrivati prima della risposta (es. "caps", appena connessa):
+            # li teniamo da parte e li elaboriamo dopo la verifica del codice
+            early.append(m)
     except (OSError, ConnectionError, struct.error):
         return False
     finally:
@@ -114,19 +116,30 @@ def _authenticate(sock, lock, code, timeout=5):
 def _session(sock, cap, on_message, code=None):
     """Gestisce una connessione con l'app finché resta aperta."""
     lock = threading.Lock()
-    if code is not None and not _authenticate(sock, lock, code):
+    early = []
+    if code is not None and not _authenticate(sock, lock, code, early):
         print("[!] codice di abbinamento errato o nessuna risposta: connessione rifiutata")
         return False
     if code is not None:
         print("[+] iPad connesso via Wi-Fi (codice verificato)")
-    from stream import StreamEncoder
+    from stream import Flow, StreamEncoder
     enc = StreamEncoder(cap)
-    state = {"ready": True, "sent_at": time.monotonic()}
+    flow = Flow(cap)
     alive = threading.Event()
     alive.set()
 
     _send_msg(sock, lock, T_HELLO,
               json.dumps({"w": cap.mon["width"], "h": cap.mon["height"]}).encode())
+
+    def handle(m):
+        if m.get("t") == "caps":
+            # app aggiornata: zone cambiate + puntatore disegnato sull'iPad (+ video)
+            enc.set_overlay(m.get("patches") and m.get("cursor"), video="h264" in (m.get("video") or []))
+        elif on_message(m):
+            flow.on_ack()  # l'app ha mostrato l'immagine: si può inviare la prossima
+
+    for m in early:  # messaggi arrivati durante la verifica del codice
+        handle(m)
 
     def receiver():
         try:
@@ -139,11 +152,7 @@ def _session(sock, cap, on_message, code=None):
                     m = json.loads(data)
                 except ValueError:
                     continue
-                if m.get("t") == "caps":
-                    # app aggiornata: zone cambiate + puntatore disegnato sull'iPad
-                    enc.set_overlay(m.get("patches") and m.get("cursor"), video="h264" in (m.get("video") or []))
-                elif on_message(m):
-                    state["ready"] = True  # l'app ha mostrato l'immagine
+                handle(m)
         except (OSError, ConnectionError, struct.error):
             pass
         finally:
@@ -154,9 +163,7 @@ def _session(sock, cap, on_message, code=None):
     keep = time.monotonic()
     while alive.is_set():
         now = time.monotonic()
-        if not state["ready"] and now - state["sent_at"] > 3:
-            state["ready"] = True  # se l'ack si perde, dopo 3 s si riparte comunque
-        msgs = enc.poll(state["ready"], 0.5)
+        msgs = enc.poll(flow.can_send, 0.5)
         if not msgs and now - keep > 2:
             ka = enc.keepalive()
             msgs = [ka] if ka else []
@@ -165,9 +172,13 @@ def _session(sock, cap, on_message, code=None):
                 if kind == "json":
                     _send_msg(sock, lock, T_CONTROL, json.dumps(data).encode())
                 else:
-                    state["ready"] = False
-                    state["sent_at"] = time.monotonic()
+                    flow.on_send()
+                    t0 = time.monotonic()
                     _send_msg(sock, lock, (T_VIDEO if data[:1] == b"V" else T_PATCH) if enc.overlay else T_FRAME, data)
+                    from stream import STATUS, status
+                    ms = (time.monotonic() - t0) * 1000
+                    prev = STATUS.get("invio_ms") or ms
+                    status(invio_ms=round(prev * 0.8 + ms * 0.2, 1), ultimo_msg_kb=len(data) // 1024)
                 keep = time.monotonic()
         except OSError:
             break

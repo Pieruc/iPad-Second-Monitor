@@ -1,3 +1,4 @@
+import AVFoundation
 import ImageIO
 import UIKit
 
@@ -14,6 +15,7 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
     private var canvas: CGContext?          // schermo del PC ricostruito (solo su decodeQueue)
     private let h264 = H264Decoder()         // video dal PC (solo su decodeQueue)
     private let pointerLayer = CAShapeLayer()
+    private let videoLayer = AVSampleBufferDisplayLayer()   // video H.264 (chip grafico)
     private var pointer: (x: CGFloat, y: CGFloat, visible: Bool, size: CGFloat)?
     private var hideStatusWork: DispatchWorkItem?
 
@@ -49,6 +51,12 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
         imageView.frame = view.bounds
         imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(imageView)
+
+        // video: decodificato e mostrato direttamente dal chip grafico
+        videoLayer.videoGravity = .resizeAspect
+        videoLayer.backgroundColor = UIColor.black.cgColor
+        videoLayer.isHidden = true
+        view.layer.addSublayer(videoLayer)
 
         // puntatore disegnato qui: il PC manda solo la sua posizione
         pointerLayer.fillColor = UIColor.white.cgColor
@@ -100,6 +108,10 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
         super.viewDidLayoutSubviews()
         sendInfo()
         updatePointer()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        videoLayer.frame = view.bounds
+        CATransaction.commit()
     }
 
     // MARK: zone cambiate e puntatore
@@ -164,6 +176,13 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
                     self.frameSize = CGSize(width: image.width, height: image.height)
                     self.updatePointer()
                     self.countFrame()
+                    if !self.videoLayer.isHidden {
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        self.videoLayer.isHidden = true
+                        self.videoLayer.flushAndRemoveImage()
+                        CATransaction.commit()
+                    }
                 }
                 self.link.send(["t": "ack"])  // pronto per l'aggiornamento successivo
             }
@@ -174,22 +193,20 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
     private func applyVideo(_ data: Data) {
         decodeQueue.async { [weak self] in
             guard let self else { return }
-            var image: CGImage?
-            if data.count > 2, data.first == 0x56,
-               let frame = self.h264.decode(data.subdata(in: data.startIndex + 2 ..< data.endIndex)) {
-                if self.canvas == nil {
-                    self.makeCanvas(width: frame.width, height: frame.height)
-                }
-                if let c = self.canvas {
-                    c.draw(frame, in: CGRect(x: 0, y: 0, width: c.width, height: c.height))
-                    image = c.makeImage()
-                }
+            var sample: CMSampleBuffer?
+            if data.count > 2, data.first == 0x56 {
+                sample = self.h264.sampleBuffer(data.subdata(in: data.startIndex + 2 ..< data.endIndex))
             }
             DispatchQueue.main.async {
-                if let image {
-                    self.imageView.image = UIImage(cgImage: image)
-                    self.frameSize = CGSize(width: image.width, height: image.height)
-                    self.updatePointer()
+                if let sample {
+                    if self.videoLayer.status == .failed { self.videoLayer.flush() }
+                    self.videoLayer.enqueue(sample)
+                    if self.videoLayer.isHidden {
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        self.videoLayer.isHidden = false
+                        CATransaction.commit()
+                    }
                     self.countFrame()
                 }
                 self.link.send(["t": "ack"])

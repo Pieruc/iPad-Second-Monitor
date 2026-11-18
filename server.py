@@ -140,7 +140,7 @@ class InputController:
 # --------------------------------------------------------------------------- #
 # Cattura schermo
 # --------------------------------------------------------------------------- #
-from stream import Capturer, StreamEncoder, print_once  # noqa: E402
+from stream import Capturer, Flow, StreamEncoder, print_once  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -200,14 +200,13 @@ async def ws_handler(request):
     loop = asyncio.get_running_loop()
     enc = StreamEncoder(cap)
     request["encoder"] = enc
-    state = {"ready": True, "sent_at": time.monotonic(), "keep": time.monotonic()}
+    flow = Flow(cap)
+    state = {"keep": time.monotonic()}
 
     async def sender():
         while not ws.closed:
             now = time.monotonic()
-            if not state["ready"] and now - state["sent_at"] > 3:
-                state["ready"] = True   # ack perso: si riparte comunque
-            msgs = await loop.run_in_executor(None, enc.poll, state["ready"], 0.5)
+            msgs = await loop.run_in_executor(None, enc.poll, flow.can_send, 0.5)
             if not msgs and now - state["keep"] > 2:
                 ka = enc.keepalive()
                 msgs = [ka] if ka else []
@@ -216,8 +215,7 @@ async def ws_handler(request):
                     if kind == "json":
                         await ws.send_str(json.dumps(data))
                     else:
-                        state["ready"] = False
-                        state["sent_at"] = time.monotonic()
+                        flow.on_send()
                         await ws.send_bytes(data)
                     state["keep"] = time.monotonic()
             except Exception:
@@ -234,7 +232,7 @@ async def ws_handler(request):
                 if m.get("t") == "caps":
                     enc.set_overlay(m.get("patches") and m.get("cursor"), video="h264" in (m.get("video") or []))
                 elif handle_client_message(m, cap, ctrl, app["cursor_allowed"]):
-                    state["ready"] = True
+                    flow.on_ack()
             elif msg.type == WSMsgType.ERROR:
                 break
     finally:

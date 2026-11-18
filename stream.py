@@ -28,6 +28,26 @@ _MSS = getattr(mss, "MSS", None) or mss.mss
 
 _last_printed = {}
 
+# Stato leggibile dall'esterno (stato.json): modalità, capacità del client, contatori
+STATUS_FILE = __import__("pathlib").Path(__file__).parent / "stato.json"
+STATUS = {"client": None, "modalita": "zone JPEG", "video_disponibile": None,
+          "fotogrammi_video": 0, "aggiornamenti_jpeg": 0, "ultimo_errore_video": None}
+_status_saved = 0.0
+
+
+def status(force=False, **kw):
+    """Aggiorna stato.json (al massimo una volta al secondo, salvo force)."""
+    global _status_saved
+    STATUS.update(kw)
+    now = time.monotonic()
+    if force or now - _status_saved > 1.0:
+        _status_saved = now
+        try:
+            STATUS_FILE.write_text(__import__("json").dumps(STATUS, indent=2, ensure_ascii=False),
+                                   encoding="utf-8")
+        except OSError:
+            pass
+
 
 def print_once(key, text):
     """Stampa `text` solo se è diverso dall'ultimo messaggio dello stesso tipo."""
@@ -264,6 +284,7 @@ class Capturer:
                 if changed and img is not None:
                     self.raw = img
                     self.frame_id += 1
+                    self._count = getattr(self, "_count", 0) + 1
                     notify = True
                 if cur != self.cursor:
                     self.cursor = cur
@@ -272,17 +293,63 @@ class Capturer:
                 if notify:
                     self.cond.notify_all()
 
+            now = time.monotonic()
+            if now - getattr(self, "_count_t", 0) >= 2:
+                status(cattura_fps=round(getattr(self, "_count", 0) / max(1e-6, now - getattr(self, "_count_t", now - 2)), 1))
+                self._count, self._count_t = 0, now
             dt = time.perf_counter() - t0
             if dt < self.interval:
                 time.sleep(self.interval - dt)
 
     def wait_change(self, frame_id, cursor_id, want_frames, timeout):
-        """Aspetta un nuovo frame (se want_frames) o un movimento del puntatore."""
+        """
+        Aspetta un nuovo frame (se want_frames) o un movimento del puntatore.
+        want_frames può essere una funzione: viene rivalutata a ogni risveglio
+        (es. quando arriva la conferma dell'iPad, vedi kick()).
+        """
         def ready():
-            return (want_frames and self.frame_id != frame_id) or self.cursor_id != cursor_id
+            want = want_frames() if callable(want_frames) else want_frames
+            return (want and self.frame_id != frame_id) or self.cursor_id != cursor_id
         with self.cond:
             self.cond.wait_for(ready, timeout)
             return self.frame_id, self.raw, self.cursor_id, self.cursor
+
+    def kick(self):
+        """Sveglia chi aspetta in wait_change (es. è arrivata una conferma)."""
+        with self.cond:
+            self.cond.notify_all()
+
+
+class Flow:
+    """
+    Controllo di flusso: al massimo `window` aggiornamenti in viaggio senza conferma.
+    Con 2 in viaggio l'attesa dell'iPad non blocca l'invio del successivo.
+    """
+    def __init__(self, cap, window=2, timeout=3.0):
+        self.cap, self.window, self.timeout = cap, window, timeout
+        self.sent = []
+        self.lock = threading.Lock()
+
+    def can_send(self):
+        now = time.monotonic()
+        with self.lock:
+            self.sent = [t for t in self.sent if now - t < self.timeout]  # conferme perse
+            return len(self.sent) < self.window
+
+    def on_send(self):
+        with self.lock:
+            self.sent.append(time.monotonic())
+
+    def on_ack(self):
+        with self.lock:
+            t = self.sent.pop(0) if self.sent else None
+        if t is not None:
+            ms = (time.monotonic() - t) * 1000
+            prev = STATUS.get("conferma_ipad_ms") or ms
+            status(conferma_ipad_ms=round(prev * 0.8 + ms * 0.2, 1))
+        kick = getattr(self.cap, "kick", None)
+        if kick:
+            kick()
 
 
 # --------------------------------------------------------------------------- #
@@ -422,7 +489,7 @@ class StreamEncoder:
     puntatore disegnato dall'iPad. `overlay=False`: immagini intere col puntatore.
     """
     FULL_RATIO = 0.5    # oltre metà schermo cambiato: conviene l'immagine intera
-    VIDEO_ENTER = 0.25  # passa al video se cambia >25% dello schermo...
+    VIDEO_ENTER = 0.15  # passa al video se va rifatto >15% dello schermo (es. video in finestra)...
     VIDEO_ENTER_N = 3   # ...in almeno 3 aggiornamenti...
     VIDEO_WINDOW = 0.8  # ...nell'arco di 0,8 s
     VIDEO_STAY = 0.02   # resta in video finché cambia almeno il 2% dei pixel...
@@ -445,6 +512,10 @@ class StreamEncoder:
         self._stop_video()
         self.video_ok = bool(on and video)
         self.overlay = bool(on)
+        desc = ("zone + puntatore" if on else "immagini intere") + \
+               (", video H.264: sì" if self.video_ok else ", video H.264: no")
+        print_once("client", f"Client: {desc}")
+        status(force=True, client=desc)
         self.last_raw = None   # la prossima volta immagine intera
         self.frame_id = 0
         self.size_sent = None
@@ -471,6 +542,8 @@ class StreamEncoder:
         cap = self.cap
         fid, raw, cid, cursor = cap.wait_change(self.frame_id, self.cursor_id,
                                                 can_send_frame, timeout)
+        if callable(can_send_frame):
+            can_send_frame = can_send_frame()
         out = []
         if self.overlay:
             if cid != self.cursor_id:
@@ -513,6 +586,7 @@ class StreamEncoder:
             self.video.close()
             self.video = None
             print_once("mode", "Modalità: zone cambiate (JPEG)")
+            status(force=True, modalita="zone JPEG")
 
     def _start_video(self, raw):
         if NvencVideo.available is False:
@@ -522,11 +596,13 @@ class StreamEncoder:
             self.video = NvencVideo(w - w % 2, h - h % 2, max(10, round(1 / self.cap.interval)))
             NvencVideo.available = True
             print_once("mode", "Modalità: video H.264 (NVIDIA)")
+            status(force=True, modalita="video NVIDIA", video_disponibile=True)
             return True
         except Exception as e:
             NvencVideo.available = False
             self.video = None
             print(f"[!] video NVIDIA non disponibile ({e}): resto con le zone JPEG")
+            status(force=True, video_disponibile=False, ultimo_errore_video=str(e))
             return False
 
     def _frame(self, raw):
@@ -538,12 +614,18 @@ class StreamEncoder:
                 self.busy_at = now
             if now - self.busy_at <= self.VIDEO_EXIT:
                 try:
+                    t0 = time.perf_counter()
                     data = self.video.encode(raw)
                     if data:
+                        ms = (time.perf_counter() - t0) * 1000
+                        prev = STATUS.get("codifica_video_ms") or ms
+                        status(fotogrammi_video=STATUS["fotogrammi_video"] + 1,
+                               codifica_video_ms=round(prev * 0.8 + ms * 0.2, 1))
                         return data
                 except Exception as e:
                     print(f"[!] errore video: {e}")
                     NvencVideo.available = False
+                    status(force=True, video_disponibile=False, ultimo_errore_video=str(e))
             # fine del video: torna alle zone con un'immagine intera nitida
             self._stop_video()
             self.last_raw = None
@@ -564,6 +646,7 @@ class StreamEncoder:
                     data = self.video.encode(raw)
                     if data:
                         return data
+        status(aggiornamenti_jpeg=STATUS["aggiornamenti_jpeg"] + 1, ultima_area_cambiata=round(area, 3))
         return self._patches(raw, rects)
 
     # ------------------------------------------------------------ zone JPEG
