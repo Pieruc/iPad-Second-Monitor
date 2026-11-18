@@ -23,7 +23,7 @@ import time
 
 USBMUXD = ("127.0.0.1", 27015)
 APP_PORT = 7878
-T_HELLO, T_FRAME, T_AUTH, T_PATCH, T_CONTROL, T_JSON = 1, 2, 3, 4, 5, 10
+T_HELLO, T_FRAME, T_AUTH, T_PATCH, T_CONTROL, T_VIDEO, T_JSON = 1, 2, 3, 4, 5, 6, 10
 CLIENT = {"ClientVersionString": "ipad-second-screen", "ProgName": "ipad-second-screen"}
 
 
@@ -141,7 +141,7 @@ def _session(sock, cap, on_message, code=None):
                     continue
                 if m.get("t") == "caps":
                     # app aggiornata: zone cambiate + puntatore disegnato sull'iPad
-                    enc.set_overlay(m.get("patches") and m.get("cursor"))
+                    enc.set_overlay(m.get("patches") and m.get("cursor"), video="h264" in (m.get("video") or []))
                 elif on_message(m):
                     state["ready"] = True  # l'app ha mostrato l'immagine
         except (OSError, ConnectionError, struct.error):
@@ -167,7 +167,7 @@ def _session(sock, cap, on_message, code=None):
                 else:
                     state["ready"] = False
                     state["sent_at"] = time.monotonic()
-                    _send_msg(sock, lock, T_PATCH if enc.overlay else T_FRAME, data)
+                    _send_msg(sock, lock, (T_VIDEO if data[:1] == b"V" else T_PATCH) if enc.overlay else T_FRAME, data)
                 keep = time.monotonic()
         except OSError:
             break

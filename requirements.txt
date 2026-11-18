@@ -4,3 +4,4 @@ Pillow>=10.0
 dxcam>=0.1
 numpy
 cryptography>=41
+av>=12

@@ -150,6 +150,69 @@
     }
   }
 
+  // ---------- video H.264 (quando cambia gran parte dello schermo) ----------
+  // Il PC passa al video compresso dalla scheda NVIDIA durante video e scorrimenti;
+  // qui lo decodifica il chip video dell'iPad (WebCodecs).
+  const canVideo = typeof VideoDecoder !== 'undefined' && typeof EncodedVideoChunk !== 'undefined';
+  let vdec = null, vcodec = null, vts = 0, vAckPending = false;
+
+  function avcCodecString(u8) {
+    // cerca l'SPS (NAL tipo 7) per ricavare profilo e livello: "avc1.PPCCLL"
+    for (let i = 0; i + 4 < u8.length; i++) {
+      if (u8[i] === 0 && u8[i + 1] === 0 && (u8[i + 2] === 1 || (u8[i + 2] === 0 && u8[i + 3] === 1))) {
+        const s = u8[i + 2] === 1 ? i + 3 : i + 4;
+        if ((u8[s] & 0x1f) === 7) {
+          const h = (x) => x.toString(16).padStart(2, '0');
+          return 'avc1.' + h(u8[s + 1]) + h(u8[s + 2]) + h(u8[s + 3]);
+        }
+      }
+    }
+    return null;
+  }
+
+  function videoAck() {
+    if (vAckPending) { vAckPending = false; send({ t: 'ack' }); }
+  }
+
+  function makeDecoder(codec) {
+    if (vdec && vdec.state !== 'closed') vdec.close();
+    vcodec = codec;
+    vdec = new VideoDecoder({
+      output: (frame) => {
+        const w = screenCanvas.width || frame.displayWidth, h = screenCanvas.height || frame.displayHeight;
+        if (!screenCanvas.width) setScreenSize(w, h);
+        sctx.drawImage(frame, 0, 0, w, h);
+        frame.close();
+        if (lastBitmap) { lastBitmap.close(); lastBitmap = null; }
+        compose();
+        fpsCount++;
+        videoAck();
+      },
+      error: (e) => { console.error(e); vdec = null; vcodec = null; videoAck(); },
+    });
+    vdec.configure({ codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' });
+  }
+
+  // Restituisce true se il fotogramma è stato passato al decoder (l'ack arriverà dopo).
+  function handleVideo(buf) {
+    const u8 = new Uint8Array(buf);
+    const key = u8[1] === 1;
+    const data = u8.subarray(2);
+    if (key) {
+      const codec = avcCodecString(data);
+      if (codec && (!vdec || vdec.state === 'closed' || codec !== vcodec)) makeDecoder(codec);
+    }
+    if (!vdec || vdec.state !== 'configured') return false;  // in attesa di un fotogramma chiave
+    try {
+      vdec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: (vts++) * 33333, data }));
+      vAckPending = true;
+      return true;
+    } catch (e) {
+      console.error(e);
+      return false;
+    }
+  }
+
   // ---------- connessione ----------
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -162,7 +225,7 @@
     sock.onopen = () => {
       showStatus('Connesso', true);
       // questa pagina sa ricomporre le zone cambiate e disegnare il puntatore
-      send({ t: 'caps', patches: true, cursor: true });
+      send({ t: 'caps', patches: true, cursor: true, video: canVideo ? ['h264'] : [] });
       send({ t: 'cursor', on: drawCursor });
       sendInfo();
     };
@@ -176,7 +239,10 @@
       }
       try {
         const buf = ev.data;
-        if (new Uint8Array(buf, 0, 1)[0] === 0x50) {     // "P": zone cambiate
+        const kind = new Uint8Array(buf, 0, 1)[0];
+        if (kind === 0x56) {                              // "V": video H.264
+          if (handleVideo(buf)) return;                   // l'ack lo manda il decoder
+        } else if (kind === 0x50) {                       // "P": zone cambiate
           if (lastBitmap) { lastBitmap.close(); lastBitmap = null; }
           await applyPatches(buf);
         } else {                                          // immagine intera (server vecchio)

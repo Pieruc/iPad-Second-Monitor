@@ -12,6 +12,7 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
     private let statusLabel = PaddedLabel()
     private let decodeQueue = DispatchQueue(label: "secondscreen.decode")
     private var canvas: CGContext?          // schermo del PC ricostruito (solo su decodeQueue)
+    private let h264 = H264Decoder()         // video dal PC (solo su decodeQueue)
     private let pointerLayer = CAShapeLayer()
     private var pointer: (x: CGFloat, y: CGFloat, visible: Bool, size: CGFloat)?
     private var hideStatusWork: DispatchWorkItem?
@@ -78,13 +79,14 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
         link.onConnected = { [weak self] _ in
             guard let self else { return }
             // questa app sa ricomporre le zone cambiate e disegnare il puntatore
-            self.link.send(["t": "caps", "patches": true, "cursor": true])
+            self.link.send(["t": "caps", "patches": true, "cursor": true, "video": ["h264"]])
             self.link.send(["t": "cursor", "on": self.drawCursor])
             self.sendInfo()
         }
         link.onHello = { _ in }
         link.onFrame = { [weak self] data in self?.decode(data) }
         link.onPatches = { [weak self] data in self?.applyPatches(data) }
+        link.onVideo = { [weak self] data in self?.applyVideo(data) }
         link.onControl = { [weak self] msg in self?.handleControl(msg) }
         showStatus("Avvio…", autoHide: false)
         link.start()
@@ -164,6 +166,33 @@ final class ScreenViewController: UIViewController, UIPointerInteractionDelegate
                     self.countFrame()
                 }
                 self.link.send(["t": "ack"])  // pronto per l'aggiornamento successivo
+            }
+        }
+    }
+
+    /// Video H.264 dal PC: b"V" + 1 byte (fotogramma chiave) + flusso Annex B.
+    private func applyVideo(_ data: Data) {
+        decodeQueue.async { [weak self] in
+            guard let self else { return }
+            var image: CGImage?
+            if data.count > 2, data.first == 0x56,
+               let frame = self.h264.decode(data.subdata(in: data.startIndex + 2 ..< data.endIndex)) {
+                if self.canvas == nil {
+                    self.makeCanvas(width: frame.width, height: frame.height)
+                }
+                if let c = self.canvas {
+                    c.draw(frame, in: CGRect(x: 0, y: 0, width: c.width, height: c.height))
+                    image = c.makeImage()
+                }
+            }
+            DispatchQueue.main.async {
+                if let image {
+                    self.imageView.image = UIImage(cgImage: image)
+                    self.frameSize = CGSize(width: image.width, height: image.height)
+                    self.updatePointer()
+                    self.countFrame()
+                }
+                self.link.send(["t": "ack"])
             }
         }
     }

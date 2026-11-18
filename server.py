@@ -232,7 +232,7 @@ async def ws_handler(request):
                 except ValueError:
                     continue
                 if m.get("t") == "caps":
-                    enc.set_overlay(m.get("patches") and m.get("cursor"))
+                    enc.set_overlay(m.get("patches") and m.get("cursor"), video="h264" in (m.get("video") or []))
                 elif handle_client_message(m, cap, ctrl, app["cursor_allowed"]):
                     state["ready"] = True
             elif msg.type == WSMsgType.ERROR:

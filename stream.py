@@ -343,6 +343,63 @@ def changed_rects(old, new):
     return rects
 
 
+def change_fraction(old, new):
+    """Frazione (0..1) dello schermo cambiata, stimata su una riga ogni 4 (veloce)."""
+    if old is None or old.shape != new.shape:
+        return 1.0
+    po, pn = _as_pairs(old)[0], _as_pairs(new)[0]
+    return float((po[::4] != pn[::4]).mean())
+
+
+class NvencVideo:
+    """
+    Video H.264 compresso dalla scheda NVIDIA (NVENC). Riceve direttamente i pixel
+    BGRA: conversione dei colori e compressione le fa la GPU, non il processore.
+    Messaggio: b"V" + 1 byte (1 = fotogramma chiave) + flusso H.264 Annex B.
+    """
+    available = None  # None = non ancora provato
+
+    def __init__(self, width, height, fps, bitrate=10_000_000):
+        import fractions
+        import av
+        self.av = av
+        cc = av.CodecContext.create("h264_nvenc", "w")
+        cc.width, cc.height = width, height
+        cc.pix_fmt = "bgra"
+        cc.time_base = fractions.Fraction(1, fps)
+        cc.framerate = fps
+        cc.bit_rate = bitrate
+        cc.gop_size = fps * 4        # un fotogramma chiave ogni 4 s (ripresa da errori)
+        cc.max_b_frames = 0
+        cc.options = {"preset": "p1", "tune": "ull", "zerolatency": "1", "delay": "0",
+                      "profile": "high", "rc": "vbr", "maxrate": str(bitrate * 2)}
+        cc.open()
+        self.cc = cc
+        self.width, self.height = width, height
+        self.n = 0
+
+    def encode(self, raw):
+        frame = raw[:self.height, :self.width]
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+        vf = self.av.VideoFrame.from_ndarray(frame, format="bgra")
+        vf.pts = self.n
+        self.n += 1
+        packets = self.cc.encode(vf)
+        data = b"".join(bytes(p) for p in packets)
+        if not data:
+            return None
+        key = any(p.is_keyframe for p in packets)
+        return b"V" + bytes([1 if key else 0]) + data
+
+    def close(self):
+        try:
+            self.cc.encode(None)  # svuota il codificatore
+        except Exception:
+            pass
+        self.cc = None
+
+
 def encode_region(raw, x0, y0, x1, y1, quality, scale, draw=None):
     """Comprime in JPEG una zona della schermata. Restituisce (x, y, jpeg) in scala."""
     crop = np.ascontiguousarray(raw[y0:y1, x0:x1])
@@ -364,18 +421,29 @@ class StreamEncoder:
     Stato di un client. `overlay=True` (client aggiornati): zone cambiate +
     puntatore disegnato dall'iPad. `overlay=False`: immagini intere col puntatore.
     """
-    FULL_RATIO = 0.5  # oltre metà schermo cambiato: conviene l'immagine intera
+    FULL_RATIO = 0.5    # oltre metà schermo cambiato: conviene l'immagine intera
+    VIDEO_ENTER = 0.25  # passa al video se cambia >25% dello schermo...
+    VIDEO_ENTER_N = 3   # ...in almeno 3 aggiornamenti...
+    VIDEO_WINDOW = 0.8  # ...nell'arco di 0,8 s
+    VIDEO_STAY = 0.02   # resta in video finché cambia almeno il 2% dei pixel...
+    VIDEO_EXIT = 1.5    # ...altrimenti dopo 1,5 s torna alle zone (e la NVIDIA si riposa)
 
     def __init__(self, cap):
         self.cap = cap
         self.overlay = False
+        self.video_ok = False     # il client sa decodificare H.264
+        self.video = None         # NvencVideo attivo
+        self.big_changes = []     # istanti degli ultimi aggiornamenti "grandi"
+        self.busy_at = 0.0
         self.last_raw = None
         self.frame_id = 0
         self.cursor_id = 0
         self.size_sent = None
         self.last_cursor_msg = None
 
-    def set_overlay(self, on):
+    def set_overlay(self, on, video=False):
+        self._stop_video()
+        self.video_ok = bool(on and video)
         self.overlay = bool(on)
         self.last_raw = None   # la prossima volta immagine intera
         self.frame_id = 0
@@ -411,14 +479,23 @@ class StreamEncoder:
                 if msg != self.last_cursor_msg:
                     self.last_cursor_msg = msg
                     out.append(("json", msg))
-            if can_send_frame and raw is not None and fid != self.frame_id:
+            if (can_send_frame and raw is not None and self.video is not None
+                    and fid == self.frame_id and time.monotonic() - self.busy_at > self.VIDEO_EXIT):
+                # lo schermo si è fermato: chiude il video e rimanda un'immagine nitida
+                self._stop_video()
+                self.last_raw = None
+                out.append(("bin", self._patches(raw)))
+            elif can_send_frame and raw is not None and fid != self.frame_id:
                 self.frame_id = fid
                 size = self.scaled_size(raw)
                 if size != self.size_sent:
                     self.size_sent = size
                     self.last_raw = None
+                    self._stop_video()
                     out.append(("json", {"t": "size", "w": size[0], "h": size[1]}))
-                out.append(("bin", self._patches(raw)))
+                data = self._frame(raw)
+                if data:
+                    out.append(("bin", data))
         elif can_send_frame and raw is not None and (fid != self.frame_id or cid != self.cursor_id):
             self.frame_id, self.cursor_id = fid, cid
             out.append(("bin", self._full_with_cursor(raw, cursor)))
@@ -430,10 +507,71 @@ class StreamEncoder:
             return ("json", self.cursor_message(self.cap.cursor))
         return None
 
-    def _patches(self, raw):
-        cap = self.cap
+    # ------------------------------------------------------------ video
+    def _stop_video(self):
+        if self.video is not None:
+            self.video.close()
+            self.video = None
+            print_once("mode", "Modalità: zone cambiate (JPEG)")
+
+    def _start_video(self, raw):
+        if NvencVideo.available is False:
+            return False
+        h, w = raw.shape[:2]
+        try:
+            self.video = NvencVideo(w - w % 2, h - h % 2, max(10, round(1 / self.cap.interval)))
+            NvencVideo.available = True
+            print_once("mode", "Modalità: video H.264 (NVIDIA)")
+            return True
+        except Exception as e:
+            NvencVideo.available = False
+            self.video = None
+            print(f"[!] video NVIDIA non disponibile ({e}): resto con le zone JPEG")
+            return False
+
+    def _frame(self, raw):
+        now = time.monotonic()
+        if self.video is not None:
+            frac = change_fraction(self.last_raw, raw)
+            self.last_raw = raw
+            if frac >= self.VIDEO_STAY:
+                self.busy_at = now
+            if now - self.busy_at <= self.VIDEO_EXIT:
+                try:
+                    data = self.video.encode(raw)
+                    if data:
+                        return data
+                except Exception as e:
+                    print(f"[!] errore video: {e}")
+                    NvencVideo.available = False
+            # fine del video: torna alle zone con un'immagine intera nitida
+            self._stop_video()
+            self.last_raw = None
+            return self._patches(raw)
+
         h, w = raw.shape[:2]
         rects = changed_rects(self.last_raw, raw)
+        # area che andrebbe ricompressa in JPEG (conta più dei pixel cambiati:
+        # scorrendo una pagina cambiano pochi pixel ma su quasi tutto lo schermo)
+        area = 1.0 if rects is None else sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects) / (w * h)
+        if self.video_ok and NvencVideo.available is not False:
+            if area >= self.VIDEO_ENTER:
+                self.big_changes = [t for t in self.big_changes if now - t < self.VIDEO_WINDOW] + [now]
+                if len(self.big_changes) >= self.VIDEO_ENTER_N and self._start_video(raw):
+                    self.big_changes = []
+                    self.busy_at = now
+                    self.last_raw = raw
+                    data = self.video.encode(raw)
+                    if data:
+                        return data
+        return self._patches(raw, rects)
+
+    # ------------------------------------------------------------ zone JPEG
+    def _patches(self, raw, rects=False):
+        cap = self.cap
+        h, w = raw.shape[:2]
+        if rects is False:
+            rects = changed_rects(self.last_raw, raw)
         if rects is None or sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects) > self.FULL_RATIO * w * h:
             rects = [[0, 0, w, h]]
         self.last_raw = raw

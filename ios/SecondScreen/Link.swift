@@ -18,12 +18,13 @@ import Network
 final class Link {
     static let port: UInt16 = 7878
 
-    enum MsgType: UInt8 { case hello = 1, frame = 2, auth = 3, patches = 4, control = 5, json = 10 }
+    enum MsgType: UInt8 { case hello = 1, frame = 2, auth = 3, patches = 4, control = 5, video = 6, json = 10 }
 
     var onState: ((String) -> Void)?
     var onHello: (([String: Any]) -> Void)?
     var onFrame: ((Data) -> Void)?
     var onPatches: ((Data) -> Void)?
+    var onVideo: ((Data) -> Void)?
     var onControl: (([String: Any]) -> Void)?
     var onConnected: ((_ viaUSB: Bool) -> Void)?
     var onDisconnected: (() -> Void)?
@@ -160,6 +161,8 @@ final class Link {
             onFrame?(payload)  // decodificato fuori dal thread principale da chi lo riceve
         case .patches:
             onPatches?(payload)
+        case .video:
+            onVideo?(payload)
         case .control:
             if let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] {
                 DispatchQueue.main.async { self.onControl?(obj) }
