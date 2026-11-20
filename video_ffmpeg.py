@@ -2,8 +2,7 @@
 Video H.264 catturato e compresso da FFmpeg (processo separato).
 
 FFmpeg cattura lo schermo virtuale con le DirectX (ddagrab) e lo comprime con il
-codificatore hardware: prima Media Foundation sul chip Intel (l'immagine non passa mai
-dalla CPU), poi Intel Quick Sync, poi NVIDIA NVENC (la NVIDIA resta spenta se non serve). Lavorando in un processo a parte non rallenta la cattura in Python
+codificatore hardware: prima Intel Quick Sync (la NVIDIA resta spenta), poi NVIDIA NVENC. Lavorando in un processo a parte non rallenta la cattura in Python
 (prima i due lavori si bloccavano a vicenda) e arriva a 60 fotogrammi al secondo.
 
 Il flusso esce in formato FLV (ogni pacchetto ha la sua lunghezza, facile da
@@ -19,11 +18,11 @@ from ctypes import wintypes
 
 ENCODERS = [
     # nome, filtri dopo la cattura, opzioni
-    # 1) Media Foundation (codificatore Intel di Windows): l'immagine resta nella scheda
-    #    video dalla cattura alla compressione, quasi nessun lavoro per la CPU
-    ("h264_mf", "", ["-hw_encoding", "1", "-scenario", "display_remoting", "-rate_control", "cbr"]),
-    # 2) Quick Sync e NVENC: l'immagine passa dalla CPU per la conversione dei colori
-    ("h264_qsv", "hwdownload,format=bgra,format=nv12",
+    # La conversione dei colori (BGRA -> NV12) è la parte che pesa sulla CPU: "neighbor"
+    # prende il colore di un pixel invece di fare la media, costa circa la metà e nei
+    # video non si nota. (Media Foundation costava meno CPU ma tratteneva i fotogrammi:
+    # fino a 2 secondi di ritardo, quindi non si usa.)
+    ("h264_qsv", "hwdownload,format=bgra,scale=flags=neighbor,format=nv12",
      ["-preset", "veryfast", "-async_depth", "1", "-look_ahead", "0"]),
     ("h264_nvenc", "hwdownload,format=bgra",
      ["-preset", "p1", "-tune", "ull", "-zerolatency", "1", "-delay", "0"]),
@@ -201,7 +200,7 @@ class FfmpegVideo:
                 body = data[5:]
                 if ptype == 0:  # configurazione: SPS e PPS
                     if len(body) < 7:
-                        continue  # Media Foundation: SPS/PPS arrivano dentro i fotogrammi
+                        continue  # intestazione vuota: SPS/PPS arrivano dentro i fotogrammi
                     length_size = (body[4] & 3) + 1
                     n_sps = body[5] & 0x1F
                     i = 6

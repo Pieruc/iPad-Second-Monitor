@@ -571,8 +571,7 @@ class StreamEncoder:
                 self.video_on = True
                 self.busy_at = now
                 cap.light = True
-                label = {"h264_mf": "Intel (Media Foundation)",
-                         "h264_qsv": "Intel Quick Sync"}.get(video.encoder, "NVIDIA")
+                label = "Intel Quick Sync" if video.encoder == "h264_qsv" else "NVIDIA"
                 print_once("mode", f"Modalità: video H.264 ({label})")
                 status(force=True, modalita=f"video {label}", video_disponibile=True)
             elif not video.alive() or now - self.pending_since > 6:
