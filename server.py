@@ -11,6 +11,12 @@ Uso:
     python server.py --fps 30 --quality 70 --scale 1.0
 """
 
+import os
+
+# numpy prepara buffer di calcolo per ogni core (circa 230 MB) che qui non servono:
+# va impostato prima di importare numpy
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import argparse
 import asyncio
 import ctypes

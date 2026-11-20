@@ -2,8 +2,8 @@
 Video H.264 catturato e compresso da FFmpeg (processo separato).
 
 FFmpeg cattura lo schermo virtuale con le DirectX (ddagrab) e lo comprime con il
-codificatore hardware: prima prova Intel Quick Sync (la NVIDIA resta spenta), poi
-NVIDIA NVENC. Lavorando in un processo a parte non rallenta la cattura in Python
+codificatore hardware: prima Media Foundation sul chip Intel (l'immagine non passa mai
+dalla CPU), poi Intel Quick Sync, poi NVIDIA NVENC (la NVIDIA resta spenta se non serve). Lavorando in un processo a parte non rallenta la cattura in Python
 (prima i due lavori si bloccavano a vicenda) e arriva a 60 fotogrammi al secondo.
 
 Il flusso esce in formato FLV (ogni pacchetto ha la sua lunghezza, facile da
@@ -18,9 +18,15 @@ import time
 from ctypes import wintypes
 
 ENCODERS = [
-    # nome, formato pixel in ingresso, opzioni
-    ("h264_qsv", "nv12", ["-preset", "veryfast", "-async_depth", "1", "-look_ahead", "0"]),
-    ("h264_nvenc", "bgra", ["-preset", "p1", "-tune", "ull", "-zerolatency", "1", "-delay", "0"]),
+    # nome, filtri dopo la cattura, opzioni
+    # 1) Media Foundation (codificatore Intel di Windows): l'immagine resta nella scheda
+    #    video dalla cattura alla compressione, quasi nessun lavoro per la CPU
+    ("h264_mf", "", ["-hw_encoding", "1", "-scenario", "display_remoting", "-rate_control", "cbr"]),
+    # 2) Quick Sync e NVENC: l'immagine passa dalla CPU per la conversione dei colori
+    ("h264_qsv", "hwdownload,format=bgra,format=nv12",
+     ["-preset", "veryfast", "-async_depth", "1", "-look_ahead", "0"]),
+    ("h264_nvenc", "hwdownload,format=bgra",
+     ["-preset", "p1", "-tune", "ull", "-zerolatency", "1", "-delay", "0"]),
 ]
 
 
@@ -129,12 +135,12 @@ class FfmpegVideo:
                 pass
 
     # ------------------------------------------------------------ processo
-    def _command(self, enc, pix, opts):
+    def _command(self, enc, filters, opts):
         return [_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostdin",
                 "-init_hw_device", f"d3d11va=dx:{self.adapter}", "-filter_hw_device", "dx",
                 "-filter_complex",
-                f"ddagrab=output_idx={self.output}:framerate={self.fps}:draw_mouse=0:dup_frames=0,"
-                f"hwdownload,format=bgra,format={pix}",
+                f"ddagrab=output_idx={self.output}:framerate={self.fps}:draw_mouse=0:dup_frames=0"
+                + ("," + filters if filters else ""),
                 "-fps_mode", "passthrough", "-c:v", enc, *opts, "-bf", "0", "-g", str(self.fps * 2),
                 "-force_key_frames", "expr:gte(t,n_forced*1)",
                 "-b:v", str(self.bitrate), "-maxrate", str(self.bitrate * 2),
@@ -142,11 +148,11 @@ class FfmpegVideo:
 
     def _run(self):
         candidates = [e for e in ENCODERS if e[0] == FfmpegVideo.chosen] or ENCODERS
-        for enc, pix, opts in candidates:
+        for enc, filters, opts in candidates:
             if self.closed:
                 return
             try:
-                self.proc = subprocess.Popen(self._command(enc, pix, opts), stdout=subprocess.PIPE,
+                self.proc = subprocess.Popen(self._command(enc, filters, opts), stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                              creationflags=subprocess.CREATE_NO_WINDOW)
             except OSError as e:
@@ -194,6 +200,8 @@ class FfmpegVideo:
                 ptype = data[1]
                 body = data[5:]
                 if ptype == 0:  # configurazione: SPS e PPS
+                    if len(body) < 7:
+                        continue  # Media Foundation: SPS/PPS arrivano dentro i fotogrammi
                     length_size = (body[4] & 3) + 1
                     n_sps = body[5] & 0x1F
                     i = 6

@@ -492,7 +492,7 @@ class StreamEncoder:
     VIDEO_WINDOW = 0.8  # ...nell'arco di 0,8 s
     VIDEO_STAY = 0.02   # resta in video finché cambia almeno il 2% dei pixel...
     VIDEO_EXIT = 1.5    # ...altrimenti dopo 1,5 s torna alle zone
-    VIDEO_WARM = 60     # FFmpeg resta pronto 60 s dopo l'ultimo uso, poi si chiude
+    VIDEO_WARM = 20     # FFmpeg resta pronto 20 s dopo l'ultimo uso, poi si chiude (libera ~300 MB)
 
     def __init__(self, cap):
         self.cap = cap
@@ -571,7 +571,8 @@ class StreamEncoder:
                 self.video_on = True
                 self.busy_at = now
                 cap.light = True
-                label = "Intel Quick Sync" if video.encoder == "h264_qsv" else "NVIDIA"
+                label = {"h264_mf": "Intel (Media Foundation)",
+                         "h264_qsv": "Intel Quick Sync"}.get(video.encoder, "NVIDIA")
                 print_once("mode", f"Modalità: video H.264 ({label})")
                 status(force=True, modalita=f"video {label}", video_disponibile=True)
             elif not video.alive() or now - self.pending_since > 6:
